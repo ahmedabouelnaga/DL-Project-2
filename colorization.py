@@ -18,7 +18,7 @@ class ColorizationDataset(Dataset):
       - ab channels as target (shape: 2 x H x W).
     Applies optional data augmentations (random scaling, random flips, etc.).
     """
-    def __init__(self, image_dir, transform=None, final_size=128):
+    def __init__(self, image_dir, target_ab_dir=None, transform=None, final_size=128):
         super().__init__()
         # Collect all image files with given extensions
         exts = ["*.jpg", "*.jpeg", "*.png"]
@@ -27,37 +27,64 @@ class ColorizationDataset(Dataset):
             self.files.extend(glob.glob(os.path.join(image_dir, e)))
         self.transform = transform
         self.final_size = final_size
+        self.target_ab_dir = target_ab_dir
+        self.is_l_only = "L" in os.path.basename(image_dir)  # Check if we're using L directory
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         f = self.files[idx]
-        bgr = cv2.imread(f)  # shape: (H, W, 3) in BGR
-        if bgr is None:
-            # If file can't be read, pick a fallback
-            return self.__getitem__((idx + 1) % len(self.files))
-
-        # Convert BGR -> RGB
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-        # Apply data augmentation transform if provided
-        if self.transform:
-            rgb = self.transform(rgb, self.final_size)
+        
+        if self.is_l_only:
+            # For L-channel images, load as grayscale
+            L = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            if L is None:
+                return self.__getitem__((idx + 1) % len(self.files))
+            
+            # Apply transform if provided (for augmentation)
+            if self.transform:
+                L = self.transform(L, self.final_size)
+            else:
+                L = cv2.resize(L, (self.final_size, self.final_size))
+                
+            # For training purposes, we still need ab channels
+            # Here we use neutral values (128) since we don't have real ab data
+            a = np.full_like(L, 128)
+            b = np.full_like(L, 128)
+            
+            # Use .copy() to avoid negative strides
+            L_t = torch.from_numpy(L.copy()).unsqueeze(0).float()  # shape: (1, H, W)
+            ab_t = torch.from_numpy(np.stack([a.copy(), b.copy()], axis=0)).float()  # shape: (2, H, W)
+            return L_t, ab_t
+            
         else:
-            rgb = cv2.resize(rgb, (self.final_size, self.final_size))
+            # Original code for RGB images
+            bgr = cv2.imread(f)  # shape: (H, W, 3) in BGR
+            if bgr is None:
+                # If file can't be read, pick a fallback
+                return self.__getitem__((idx + 1) % len(self.files))
 
-        # Convert to LAB
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-        # Split channels: L, a, b
-        L = lab[:, :, 0]   # [0..255]
-        a = lab[:, :, 1]   # [0..255] with 128 as neutral
-        b = lab[:, :, 2]   # [0..255] with 128 as neutral
+            # Convert BGR -> RGB
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-        # Use .copy() to avoid negative strides
-        L_t = torch.from_numpy(L.copy()).unsqueeze(0).float()  # shape: (1, H, W)
-        ab_t = torch.from_numpy(np.stack([a.copy(), b.copy()], axis=0)).float()  # shape: (2, H, W)
-        return L_t, ab_t
+            # Apply data augmentation transform if provided
+            if self.transform:
+                rgb = self.transform(rgb, self.final_size)
+            else:
+                rgb = cv2.resize(rgb, (self.final_size, self.final_size))
+
+            # Convert to LAB
+            lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+            # Split channels: L, a, b
+            L = lab[:, :, 0]   # [0..255]
+            a = lab[:, :, 1]   # [0..255] with 128 as neutral
+            b = lab[:, :, 2]   # [0..255] with 128 as neutral
+
+            # Use .copy() to avoid negative strides
+            L_t = torch.from_numpy(L.copy()).unsqueeze(0).float()  # shape: (1, H, W)
+            ab_t = torch.from_numpy(np.stack([a.copy(), b.copy()], axis=0)).float()  # shape: (2, H, W)
+            return L_t, ab_t
 
 ###############################################################################
 # 2) Data Augmentation: Random Scaling + Horizontal Flip
@@ -258,8 +285,8 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Path to your dataset directory (adjust as needed)
-    image_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/face_images"
+    # Path to your dataset directory - changed to L directory
+    image_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/L"
 
     # Create dataset with data augmentation
     dataset = ColorizationDataset(
