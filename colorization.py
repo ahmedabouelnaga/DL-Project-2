@@ -186,9 +186,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Set paths to your L, a, b folders
-    l_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/L"
-    a_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/a"
-    b_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/b"
+    l_dir = "/DATA/ahmedabouelnaga/DL-Project-2/L"
+    a_dir = "/DATA/ahmedabouelnaga/DL-Project-2/a"
+    b_dir = "/DATA/ahmedabouelnaga/DL-Project-2/b"
     
     # Create dataset from precomputed LAB images with a simple flip transform (optional)
     dataset = ColorizationLABDataset(l_dir=l_dir, a_dir=a_dir, b_dir=b_dir, transform=simple_flip)
