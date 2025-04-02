@@ -1,210 +1,293 @@
 import os
-import cv2
+import glob
+import random
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 
-# =======================
-# 1. Dataset Definition
-# =======================
+###############################################################################
+# 1) Dataset with LAB Conversion + Data Augmentation
+###############################################################################
 class ColorizationDataset(Dataset):
-    def __init__(self, l_dir, a_dir, b_dir, transform=None):
-        """
-        Args:
-            l_dir (str): Directory containing L* channel images (PNG).
-            a_dir (str): Directory containing a* channel images (PNG).
-            b_dir (str): Directory containing b* channel images (PNG).
-            transform (callable, optional): Any additional transform to apply to the L* image.
-        """
-        self.l_paths = sorted([os.path.join(l_dir, f) for f in os.listdir(l_dir) if f.endswith('.png')])
-        self.a_paths = sorted([os.path.join(a_dir, f) for f in os.listdir(a_dir) if f.endswith('.png')])
-        self.b_paths = sorted([os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.endswith('.png')])
-        
-        # Check that all folders contain the same number of images
-        assert len(self.l_paths) == len(self.a_paths) == len(self.b_paths), "Mismatch in folder image counts!"
+    """
+    Reads images from 'image_dir', converts them to LAB, and returns:
+      - L channel as input  (shape: 1 x H x W)
+      - ab channels as target (shape: 2 x H x W).
+    Applies optional data augmentations (random scaling, random flips, etc.).
+    """
+    def __init__(self, image_dir, transform=None, final_size=128):
+        super().__init__()
+        # Collect all image files with given extensions
+        exts = ["*.jpg", "*.jpeg", "*.png"]
+        self.files = []
+        for e in exts:
+            self.files.extend(glob.glob(os.path.join(image_dir, e)))
         self.transform = transform
+        self.final_size = final_size
 
     def __len__(self):
-        return len(self.l_paths)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        # Read L, a, and b images in grayscale (each as 2D arrays)
-        L_img = cv2.imread(self.l_paths[idx], cv2.IMREAD_UNCHANGED)
-        a_img = cv2.imread(self.a_paths[idx], cv2.IMREAD_UNCHANGED)
-        b_img = cv2.imread(self.b_paths[idx], cv2.IMREAD_UNCHANGED)
-        
-        if L_img is None or a_img is None or b_img is None:
-            raise ValueError(f"Error reading one or more images at index {idx}.")
-        
-        # Convert images to float32
-        L_img = L_img.astype(np.float32)
-        a_img = a_img.astype(np.float32)
-        b_img = b_img.astype(np.float32)
-        
-        # Scale L* from [0, 100] to [0, 1] (adjust if your saved range is different)
-        L_img = L_img / 100.0
-        
-        # Stack a and b channels to create a 2-channel output image
-        ab_img = np.stack((a_img, b_img), axis=0)  # shape: (2, H, W)
-        
-        # Expand dims for L to have shape (1, H, W)
-        L_img = np.expand_dims(L_img, axis=0)
-        
-        if self.transform:
-            L_img = self.transform(L_img)
-        
-        # Convert to torch tensors
-        L_tensor = torch.from_numpy(L_img)
-        ab_tensor = torch.from_numpy(ab_img)
-        return L_tensor, ab_tensor
+        f = self.files[idx]
+        bgr = cv2.imread(f)  # shape: (H, W, 3) in BGR
+        if bgr is None:
+            # If file can't be read, pick a fallback
+            return self.__getitem__((idx + 1) % len(self.files))
 
-# =======================
-# 2. Colorization Network
-# =======================
+        # Convert BGR -> RGB
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        # Apply data augmentation transform if provided
+        if self.transform:
+            rgb = self.transform(rgb, self.final_size)
+        else:
+            rgb = cv2.resize(rgb, (self.final_size, self.final_size))
+
+        # Convert to LAB
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        # Split channels: L, a, b
+        L = lab[:, :, 0]   # [0..255]
+        a = lab[:, :, 1]   # [0..255] with 128 as neutral
+        b = lab[:, :, 2]   # [0..255] with 128 as neutral
+
+        # Use .copy() to avoid negative strides
+        L_t = torch.from_numpy(L.copy()).unsqueeze(0).float()  # shape: (1, H, W)
+        ab_t = torch.from_numpy(np.stack([a.copy(), b.copy()], axis=0)).float()  # shape: (2, H, W)
+        return L_t, ab_t
+
+###############################################################################
+# 2) Data Augmentation: Random Scaling + Horizontal Flip
+###############################################################################
+def random_scale_and_flip(rgb, final_size=128, scale_min=0.8, scale_max=1.2):
+    """
+    1) Randomly scales the input image by a factor in [scale_min, scale_max].
+    2) Randomly flips horizontally (50% chance).
+    3) Resizes to (final_size, final_size).
+    """
+    h, w, c = rgb.shape
+
+    # 1) Random scaling
+    scale = random.uniform(scale_min, scale_max)
+    new_h = int(h * scale)
+    new_w = int(w * scale)
+    scaled = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # 2) Random horizontal flip
+    if random.random() > 0.5:
+        scaled = np.fliplr(scaled)
+
+    # 3) Resize to final dimensions (can be a center crop or simple resize)
+    out = cv2.resize(scaled, (final_size, final_size), interpolation=cv2.INTER_AREA)
+    return out
+
+###############################################################################
+# 3) The Colorization Network with 5 Downsampling & 5 Upsampling Layers
+###############################################################################
 class ColorizationNet(nn.Module):
+    """
+    An encoder-decoder network with 5 downsampling layers and 5 upsampling layers.
+    Input:  1-channel L
+    Output: 2-channel ab
+    Uses Batch Normalization after every conv/deconv.
+    """
     def __init__(self):
         super(ColorizationNet, self).__init__()
-        
-        # Encoder: Downsample input L channel
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=64, kernel_size=3, stride=2, padding=1),
+
+        # Downsampling layers
+        self.down1 = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True)
+        )  # -> (B, 64, H, W)
+        self.down2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True)
+        )  # -> (B, 128, H/2, W/2)
+        self.down3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Decoder: Upsample to predict a and b channels
-        self.dec1 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(True)
+        )  # -> (B, 256, H/4, W/4)
+        self.down4 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True)
+        )  # -> (B, 512, H/8, W/8)
+        self.down5 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True)
+        )  # -> (B, 512, H/16, W/16)
+
+        # Upsampling layers
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 512, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True)
+        )  # -> (B, 512, H/8, W/8)
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True)
+        )  # -> (B, 256, H/4, W/4)
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
-        self.dec2 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(True)
+        )  # -> (B, 128, H/2, W/2)
+        self.up4 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        self.dec3 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=64, out_channels=2, kernel_size=4, stride=2, padding=1)
-            # No BatchNorm on final layer. Optionally, you can apply an activation (e.g., Tanh) if normalizing ab.
-        )
+            nn.ReLU(True)
+        )  # -> (B, 64, H, W)
+        self.up5 = nn.Sequential(
+            nn.Conv2d(64, 2, kernel_size=3, stride=1, padding=1)
+        )  # -> (B, 2, H, W)
 
     def forward(self, x):
-        # x: (B, 1, H, W)
-        # Encoder
-        x = self.enc1(x)  # -> (B, 64, H/2, W/2)
-        x = self.enc2(x)  # -> (B, 128, H/4, W/4)
-        x = self.enc3(x)  # -> (B, 256, H/8, W/8)
-        # Decoder
-        x = self.dec1(x)  # -> (B, 128, H/4, W/4)
-        x = self.dec2(x)  # -> (B, 64, H/2, W/2)
-        x = self.dec3(x)  # -> (B, 2, H, W)
-        return x
+        d1 = self.down1(x)   # (B, 64, H, W)
+        d2 = self.down2(d1)  # (B, 128, H/2, W/2)
+        d3 = self.down3(d2)  # (B, 256, H/4, W/4)
+        d4 = self.down4(d3)  # (B, 512, H/8, W/8)
+        d5 = self.down5(d4)  # (B, 512, H/16, W/16)
 
-# =======================
-# 3. Training Loop
-# =======================
-def train_colorization(model, train_loader, val_loader=None, epochs=10, lr=1e-3, device='cpu'):
+        u1 = self.up1(d5)    # (B, 512, H/8, W/8)
+        u2 = self.up2(u1)    # (B, 256, H/4, W/4)
+        u3 = self.up3(u2)    # (B, 128, H/2, W/2)
+        u4 = self.up4(u3)    # (B, 64, H, W)
+        out = self.up5(u4)   # (B, 2, H, W)
+        return out
+
+###############################################################################
+# 4) Utility: Convert LAB (L, ab) to RGB for Visualization
+###############################################################################
+def lab_to_rgb(L, ab):
+    """
+    Converts L and ab tensors to a list of RGB images (uint8).
+    L:  (B, 1, H, W)
+    ab: (B, 2, H, W)
+    """
+    L_np = L.cpu().numpy()
+    ab_np = ab.cpu().numpy()
+    B = L.shape[0]
+    rgb_list = []
+    for i in range(B):
+        L_i = L_np[i, 0, :, :]
+        a_i = ab_np[i, 0, :, :]
+        b_i = ab_np[i, 1, :, :]
+
+        lab_img = np.zeros((L_i.shape[0], L_i.shape[1], 3), dtype=np.uint8)
+        lab_img[:, :, 0] = np.clip(L_i, 0, 255).astype(np.uint8)
+        lab_img[:, :, 1] = np.clip(a_i, 0, 255).astype(np.uint8)
+        lab_img[:, :, 2] = np.clip(b_i, 0, 255).astype(np.uint8)
+
+        bgr = cv2.cvtColor(lab_img, cv2.COLOR_LAB2BGR)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb_list.append(rgb)
+    return rgb_list
+
+###############################################################################
+# 5) Training Routine
+###############################################################################
+def train_model(model, train_loader, device, epochs=10, lr=1e-3):
+    model.train()
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    model.to(device)
-    
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        
-        for batch_L, batch_ab in train_loader:
-            batch_L = batch_L.to(device)      # (B, 1, H, W)
-            batch_ab = batch_ab.to(device)    # (B, 2, H, W)
-            
+
+    for epoch in range(1, epochs+1):
+        total_loss = 0.0
+        count = 0
+        for L_batch, ab_batch in train_loader:
+            L_batch, ab_batch = L_batch.to(device), ab_batch.to(device)
             optimizer.zero_grad()
-            pred_ab = model(batch_L)          # (B, 2, H, W)
-            loss = criterion(pred_ab, batch_ab)
+            ab_pred = model(L_batch)  # (B,2,H,W)
+            loss = criterion(ab_pred, ab_batch)
             loss.backward()
             optimizer.step()
-            
-            running_loss += loss.item()
-        
-        epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {epoch_loss:.4f}")
-        
-        # Optional validation
-        if val_loader is not None:
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for val_L, val_ab in val_loader:
-                    val_L = val_L.to(device)
-                    val_ab = val_ab.to(device)
-                    pred_ab = model(val_L)
-                    loss_val = criterion(pred_ab, val_ab)
-                    val_loss += loss_val.item()
-            val_loss /= len(val_loader)
-            print(f"Validation Loss: {val_loss:.4f}")
+            total_loss += loss.item() * L_batch.size(0)
+            count += L_batch.size(0)
+        epoch_loss = total_loss / count
+        print(f"Epoch {epoch}/{epochs} - Train Loss: {epoch_loss:.4f}")
 
-# =======================
-# 4. Prediction Function
-# =======================
-def predict_colorization(model, L_img_tensor, device='cpu'):
-    """
-    Given a single L* image tensor (shape: (1, H, W)), predict full-resolution a and b channels.
-    """
+###############################################################################
+# 6) Testing Routine: Save All Predictions in Folder "colization"
+###############################################################################
+def test_and_save_predictions(model, test_loader, device):
     model.eval()
-    model.to(device)
-    with torch.no_grad():
-        # Add batch dimension: (1, 1, H, W)
-        L_img_tensor = L_img_tensor.unsqueeze(0).to(device)
-        pred_ab = model(L_img_tensor)  # (1, 2, H, W)
-    return pred_ab.squeeze(0)  # (2, H, W)
+    criterion = nn.MSELoss()
+    total_loss = 0.0
+    count = 0
 
-# =======================
-# 5. Main Routine
-# =======================
-def main():
-    # Define directories containing your preprocessed images.
-    # These should be the folders where you saved your L, a, and b channel images.
-    l_dir = "L/"
-    a_dir = "a/"
-    b_dir = "b/"
-    
-    # Create the dataset and dataloader.
-    dataset = ColorizationDataset(l_dir, a_dir, b_dir)
-    # Optionally split dataset into train and validation subsets.
-    train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-    # For simplicity, here we use only training loader.
-    
-    # Instantiate the model.
-    model = ColorizationNet()
-    
-    # Determine device: use GPU if available.
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Train the model.
-    epochs = 10  # Adjust as needed
-    train_colorization(model, train_loader, epochs=epochs, lr=1e-3, device=device)
-    
-    # Test: Predict on a single sample from the dataset.
-    sample_L, sample_ab = dataset[0]
-    pred_ab = predict_colorization(model, sample_L, device=device)
-    
-    print("Sample Ground Truth ab shape:", sample_ab.shape)
-    print("Sample Predicted ab shape:", pred_ab.shape)
-    
-    # Optionally, you can combine L and predicted ab to form a LAB image,
-    # convert it to RGB (using cv2.cvtColor), and then save or display the result.
-    
+    # Create folder for saving predictions
+    os.makedirs("colization", exist_ok=True)
+    global_idx = 0
+
+    with torch.no_grad():
+        for L_batch, ab_batch in test_loader:
+            L_batch, ab_batch = L_batch.to(device), ab_batch.to(device)
+            ab_pred = model(L_batch)
+            loss = criterion(ab_pred, ab_batch)
+            total_loss += loss.item() * L_batch.size(0)
+            count += L_batch.size(0)
+
+            # Convert predicted LAB to RGB for visualization
+            pred_rgb_list = lab_to_rgb(L_batch, ab_pred)
+            for pred_rgb in pred_rgb_list:
+                save_path = os.path.join("colization", f"pred_{global_idx:04d}.png")
+                # Save as PNG (convert RGB -> BGR for OpenCV)
+                cv2.imwrite(save_path, cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR))
+                global_idx += 1
+
+    test_loss = total_loss / count
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Saved {global_idx} prediction images in folder 'colization'.")
+
+###############################################################################
+# 7) Main Script: Train and Test the Model, Save Predictions
+###############################################################################
 if __name__ == "__main__":
-    main()
+    # For reproducibility
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Path to your dataset directory (adjust as needed)
+    image_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/face_images"
+
+    # Create dataset with data augmentation
+    dataset = ColorizationDataset(
+        image_dir=image_dir,
+        transform=random_scale_and_flip,  # Data augmentation
+        final_size=128
+    )
+    n_total = len(dataset)
+    print("Total images found:", n_total)
+
+    # Split: 90% training, 10% testing
+    n_train = int(0.9 * n_total)
+    n_test  = n_total - n_train
+    train_set, test_set = random_split(dataset, [n_train, n_test])
+    print(f"Train size: {len(train_set)} | Test size: {len(test_set)}")
+
+    # DataLoaders with mini-batches
+    batch_size = 8
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+    # Instantiate the colorization model and move to device
+    model = ColorizationNet().to(device)
+
+    # Train the model
+    train_model(model, train_loader, device, epochs=10, lr=1e-3)
+
+    # Evaluate and save all predictions as PNG in folder "colization"
+    test_and_save_predictions(model, test_loader, device)
+
+    print("Colorization pipeline complete.")
