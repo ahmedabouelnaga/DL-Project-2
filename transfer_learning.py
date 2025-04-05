@@ -9,9 +9,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-# -------------------------
+
 # 1. Define a Dataset for the NCD (New Color Dataset)
-# -------------------------
+
 class NCDDataset(Dataset):
     """
     Loads images from a new dataset (NCD) for transfer learning.
@@ -50,9 +50,9 @@ class NCDDataset(Dataset):
             ab = self.transform(ab)
         return torch.from_numpy(L), torch.from_numpy(ab)
 
-# -------------------------
+
 # 2. Define the Colorization Model (Same as before)
-# -------------------------
+
 class ColorizationModel(nn.Module):
     def __init__(self, n_downsample_layers=5):
         super(ColorizationModel, self).__init__()
@@ -104,9 +104,9 @@ class ColorizationModel(nn.Module):
         x = self.tanh(x) * 127  # Scale output to approximately match LAB range for a and b
         return x
 
-# -------------------------
+
 # 3. Transfer Learning Procedure
-# -------------------------
+
 def main():
     # Device configuration: use GPU if available.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,7 +128,7 @@ def main():
         for param in block.parameters():
             param.requires_grad = False
 
-    # -------------------------
+
     # 4. Hyperparameter Tuning Considerations
     # -------------------------
     # Here you might experiment with:
