@@ -8,9 +8,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# -------------------------
+
 # 1. Dataset Definition
-# -------------------------
 class RegressorDataset(Dataset):
     """
     Dataset that loads corresponding L, a, and b channel images.
@@ -72,9 +71,9 @@ class RegressorDataset(Dataset):
         target_tensor = torch.from_numpy(target)
         return input_tensor, target_tensor
 
-# -------------------------
+
 # 2. Regressor Model Definition
-# -------------------------
+
 class RegressorCNN(nn.Module):
     def __init__(self):
         super(RegressorCNN, self).__init__()
@@ -117,9 +116,9 @@ class RegressorCNN(nn.Module):
         x = x.view(x.size(0), -1)  # Flatten to (batch, 2)
         return x
 
-# -------------------------
+
 # 3. Training and Evaluation Functions
-# -------------------------
+
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -146,9 +145,9 @@ def evaluate(model, dataloader, criterion, device):
             total_loss += loss.item() * inputs.size(0)
     return total_loss / len(dataloader.dataset)
 
-# -------------------------
+
 # 4. Main Routine
-# -------------------------
+
 def main():
     # Directories for the L, a, and b images.
     # Update these paths as needed.
