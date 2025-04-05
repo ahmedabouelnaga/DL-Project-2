@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+
 import os
 import cv2
 import glob
@@ -11,9 +11,9 @@ import torchvision.transforms as transforms
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-# -------------------------
+
 # Setup Directories
-# -------------------------
+
 L_DIR = "./L"  # Directory for L* channel images
 A_DIR = "./a"  # Directory for a* channel images
 B_DIR = "./b"  # Directory for b* channel images
@@ -25,9 +25,9 @@ print(f"L directory exists: {os.path.exists(L_DIR)}")
 print(f"a directory exists: {os.path.exists(A_DIR)}")
 print(f"b directory exists: {os.path.exists(B_DIR)}")
 
-# -------------------------
+
 # Colorization Model
-# -------------------------
+
 class ColorizationModel(nn.Module):
     def __init__(self, n_downsample_layers=5):
         super(ColorizationModel, self).__init__()
@@ -83,9 +83,9 @@ class ColorizationModel(nn.Module):
         x = x * 127  # Scale output: Tanh gives [-1,1], so multiply by 127
         return x
 
-# -------------------------
+
 # Custom Dataset for Colorization - MODIFIED to handle visualized a/b channels
-# -------------------------
+
 class ColorizationDataset(Dataset):
     def __init__(self, l_dir, a_dir, b_dir, transform=None):
         self.l_paths = sorted(glob.glob(os.path.join(l_dir, "*.*")))
@@ -176,9 +176,9 @@ class ColorizationDataset(Dataset):
             # Return a placeholder if there's an error
             return torch.zeros((1, 100, 100)), torch.zeros((2, 100, 100))
 
-# -------------------------
+
 # Alternative Dataset (SIMPLER)
-# -------------------------
+
 class SimpleColorizationDataset(Dataset):
     def __init__(self, l_dir, a_dir, b_dir, transform=None):
         self.l_paths = sorted(glob.glob(os.path.join(l_dir, "*.*")))
@@ -275,9 +275,9 @@ class SimpleColorizationDataset(Dataset):
             # Return a placeholder if there's an error
             return torch.zeros((1, 100, 100)), torch.zeros((2, 100, 100))
 
-# -------------------------
+
 # Utility Function to Save Colorized Images
-# -------------------------
+
 def save_colorized_images(model, test_loader, device):
     model.eval()
     with torch.no_grad():
@@ -309,9 +309,9 @@ def save_colorized_images(model, test_loader, device):
             cv2.imwrite(comparison_path, comparison)
             print(f"Saved image {i} to {output_path}")
 
-# -------------------------
+
 # Main Routine
-# -------------------------
+
 def main():
     # Set device configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
