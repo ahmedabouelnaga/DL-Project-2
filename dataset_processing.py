@@ -4,12 +4,12 @@ import cv2
 import torch
 import numpy as np
 
-# ---------------------------------------------------------------
+
 # 0) Set default Torch dtype to 32-bit float BEFORE loading data
 torch.set_default_dtype(torch.float32)
 # or: torch.setdefaulttensortype('torch.FloatTensor')
 
-# ---------------------------------------------------------------
+
 # 1) Load and Shuffle the Original Dataset
 img_dir_pattern = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/face_images/*.jpg"
 files = glob.glob(img_dir_pattern)
@@ -37,7 +37,7 @@ n = data_tensor.size(0)
 perm = torch.randperm(n)
 data_tensor = data_tensor[perm]
 
-# ---------------------------------------------------------------
+
 # 2) Augment the Dataset
 #    - Horizontal flip (50% chance)
 #    - Random crop -> resize
@@ -86,14 +86,14 @@ for i in range(data_tensor.size(0)):
 augmented_images = np.array(augmented_images)  # shape: (N*10, 128, 128, 3)
 print("Augmented images shape:", augmented_images.shape)
 
-# ---------------------------------------------------------------
+
 # 3) Save the Augmented Dataset (RGB) BEFORE LAB Conversion
 #    The instructions want them in a folder named "augmented/"
 os.makedirs("augmented", exist_ok=True)
 for idx, img_bgr in enumerate(augmented_images):
     cv2.imwrite(f"augmented/aug_{idx:04d}.jpg", img_bgr)
 
-# ---------------------------------------------------------------
+
 # 4) Convert to L*a*b* and Save the Augmented LAB Dataset
 #    We also need to create an intensity image for L*, and
 #    color mappings for a* (green<->magenta) and b* (blue<->yellow).
