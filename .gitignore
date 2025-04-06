@@ -1,0 +1,50 @@
+# Image directories
+face_images/
+augmented/
+augmented_lab/
+L/
+a/
+b/
+NCD_dataset/
+colization/
+ColorfulOriginal/
+Gray/
+
+# Generated model files
+*.pth
+
+# Generated output
+*.png
+*.jpg
+*.jpeg
+
+# System files
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
