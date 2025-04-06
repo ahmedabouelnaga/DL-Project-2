@@ -406,6 +406,7 @@ def main():
         print("Training complete!")
         print("Generating final colorized images...")
         save_colorized_images(model, test_loader, device)
+        torch.save(model.state_dict(), os.path.join(COLORIZED_DIR, "colorization_model.pth"))
         print(f"Colorized images saved in {COLORIZED_DIR}")
         
     except Exception as e:
