@@ -1,199 +1,175 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import cv2
 import os
-import glob
-import torch
-import numpy as np
-import random
-import shutil
 
-# torch.set_default_tensor_type('torch.FloatTensor') # Deprecated
-torch.set_default_dtype(torch.float32)
+# -- Configuration --
 
-def create_tensor_img(img):
-    """
-    Prepares image to be put into tensor
-    """
-    img = cv2.resize(img, (128, 128)) # resize to 128 x 128
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # convert to RGB
-    img = img.astype(np.float32) / 255.0 # Normalize to [0, 1]
-    img = torch.from_numpy(img).permute(2, 0, 1) # convert to tensor from numpy, change the order of the dimensions from from (H, W, C) to (C, H, W)
-    return img
+# Set batch size, learning rate, and number of epochs
+BATCH_SIZE = 10
+LEARNING_RATE = 1e-3
+NUM_EPOCHS = 20
 
-def augment_img(tensor_img, index, output_dir = "AUG_pics"):
-    """
-    Augments an image
-    
-    Random cropping is done as follows:
-    Randomly choosing a crop window of 80%-100% height/width, and placing it randomly within the full height/width. The top/left value is constrained so that the crop fits inside the image
-    
-    """
-    
-    os.makedirs(os.path.join(output_dir, "augmented_pics"), exist_ok=True)
-    
-    img = tensor_img.permute(1, 2, 0).numpy() # tensor to numpy with columns ordered as H, W, C
-    
-    # Random horizontal flip (50/50)
-    if random.random() < 0.5:
-        img = cv2.flip(img, 1)
-    
-    # Random cropping
-    h, w, _ = img.shape
-    crop_scale = random.uniform(0.8, 1.0)
-    new_h, new_w = int(h * crop_scale), int(w * crop_scale)
-    top = random.randint(0, h - new_h) # picks new starting point from top for crop
-    left = random.randint(0, w - new_w) # picks new starting point from left for crop
-    img = img[top:top+new_h, left:left+new_w] # crop the data
-    img = cv2.resize(img, (128, 128), interpolation = cv2.INTER_AREA) #resize back to input size
-    
-    # RGB value scaling
-    rgb_scale = random.uniform(0.6, 1.0) # scale factor used to darken
-    img = np.clip(img * rgb_scale, 0, 1)
-    
-    # For saving only
-    img_save = np.clip(img * rgb_scale * 255, 0, 255).astype(np.uint8)
-    cv2.imwrite(f"{output_dir}/augmented_pics/image_{index}.png", cv2.cvtColor(img_save, cv2.COLOR_RGB2BGR))
-    
-    return torch.from_numpy(img).permute(2, 0, 1) #reorder back to C, H, W
+# Part 4: GPU Computing code
+# Use CUDA if it is available (otherwise we're running on our PCs)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}") # check if CUDA is being used
+os.makedirs("colorized_outputs", exist_ok=True) # directory for output
 
-def rgb_to_lab(rgb_tensor, index, output_dir="LAB_pics"):
-    """
-    Convert RGB to LAB
-    """
-    
-    os.makedirs(os.path.join(output_dir, "L"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "a"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "b"), exist_ok=True)
-    
-    rgb = rgb_tensor.permute(1, 2, 0).numpy() # shape: [H, W, 3]
-    rgb = (rgb * 255).astype(np.uint8)
-    
-    # Convert BGR to LAB
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    
-    # Split the channels
-    L, A, B = cv2.split(lab)
-    
-    # Save L
-    cv2.imwrite(f"{output_dir}/L/image_{index}.png", L)
-    
-    # Create green-magenta a
-    lab_a_only = cv2.merge([np.full_like(L, 128), A, np.full_like(B, 128)]) # set L and B to neural constant 128 and keep A
-    a_color = cv2.cvtColor(lab_a_only, cv2.COLOR_LAB2RGB)
-    cv2.imwrite(f"{output_dir}/a/image_{index}.png", cv2.cvtColor(a_color, cv2.COLOR_RGB2BGR))
-    
-    # Create blue-yellow b
-    lab_b_only = cv2.merge([np.full_like(L, 128), np.full_like(A, 128), B])
-    b_color = cv2.cvtColor(lab_b_only, cv2.COLOR_LAB2RGB) # true blue→yellow
-    cv2.imwrite(f"{output_dir}/b/image_{index}.png", cv2.cvtColor(b_color, cv2.COLOR_RGB2BGR))
-    
-    # convert LAB back to store it
-    lab_float = lab.astype(np.float32)
-    lab_tensor = torch.from_numpy(lab_float).permute(2, 0, 1)
-    
-    return lab_tensor
+# -- Dataset wrapper class for preparation and easy retrival --
 
-def reset_output_dir(path):
-    """
-    Clears the output folder
-    """
-    if os.path.exists(path):
-        shutil.rmtree(path) # Delete the folder and all contents
-    os.makedirs(path, exist_ok=True)  # Recreate it empty
+class LabDataset(Dataset):
+    def __init__(self, data_tensor):
+        # Normalize L* from [0, 100] to [0, 1], ab from [-128, 127] to [-1, 1]
+        self.L = data_tensor[:, 0:1] / 100.0
+        self.ab = data_tensor[:, 1:3] / 128.0
+    
+    def __len__(self):
+        # returns number of items in dataset
+        return self.L.shape[0]
+    
+    def __getitem__(self, idx):
+        # gets a specific sample given the index
+        return self.L[idx], self.ab[idx]
 
-def main():
-    """
-    Main function to run the script
-    """
-    
-    # -- Clear data from previous directories --
-    reset_output_dir("LAB_pics")
-    reset_output_dir("LAB_pics/L")
-    reset_output_dir("LAB_pics/a")
-    reset_output_dir("LAB_pics/b")
-    reset_output_dir("AUG_pics")
-    reset_output_dir("AUG_pics/augmented_pics")
-    
-    # -- Loading data --
-    img_dir = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/DL-Project-2/face_images" #path to images DIR
-    
-    # Check if directory exists, if not try an alternative path
-    if not os.path.exists(img_dir):
-        print(f"Warning: Directory {img_dir} not found.")
-        # Try looking in current directory or parent directory
-        alternative_paths = [
-            "face_images",
-            "DL-Project-2/face_images",
-            "../datasets/face_images/face_images",
-            "."
-        ]
+# -- Model class --
+
+class ColorizationNet(nn.Module):
+    def __init__(self):
+        # define network layers
+        super(ColorizationNet, self).__init__()
         
-        for path in alternative_paths:
-            if os.path.exists(path):
-                img_dir = path
-                print(f"Using alternative directory: {img_dir}")
-                break
+        def down_block(in_ch, out_ch):
+            # convolution block that downsamples (halves resolution)
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch), # normalizes the output of the previous layer
+                nn.ReLU(inplace=True), # introduce non-linearity
+                nn.MaxPool2d(2) # reduces spatial resolution by half
+            )
+        
+        def up_block(in_ch, out_ch):
+            # convolution block that upsamples (doubles resolution)
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True)
+            )
+        
+        # Encoder: reduces spatial resolution
+        self.encoder = nn.Sequential(
+            down_block(1, 64),    # 128 to 64
+            down_block(64, 128),  # 64 to 32
+            down_block(128, 256), # 32 to 16
+            down_block(256, 512), # 16 to 8
+            down_block(512, 512)  # 8 to 4
+        )
+        
+        # Decoder: restores resolution while dropping channels
+        self.decoder = nn.Sequential(
+            up_block(512, 512),  # spatial resolution going from 4 to 8
+            up_block(512, 256),  # 8 to 16
+            up_block(256, 128),  # 16 to 32
+            up_block(128, 64),   # 32 to 64
+            up_block(64, 32),    # 64 to 128
+            # (batch_size, 32, 128, 128) to (batch_size, 2, 128, 128) for a* and b* channels
+            nn.Conv2d(32, 2, kernel_size=3, padding=1)
+        )
     
-    # Search for image files with multiple extensions
-    files = []
-    for ext in ['*.jpg', '*.jpeg', '*.png']:
-        files.extend(glob.glob(os.path.join(img_dir, ext)))
+    def forward(self, x):
+        # Returns the output of encoding and decoding
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x  # Output: (batch_size, 2, 128, 128)
+
+# -- Helper function to convert LAB to BGR for saving images --
+def lab_to_bgr(L, ab):
+    L = (L.squeeze().cpu().numpy() * 100).astype(np.uint8)
+    ab = (ab.squeeze().cpu().numpy() * 128).astype(np.int8)
+    lab = np.zeros((128, 128, 3), dtype=np.uint8)
+    lab[:, :, 0] = L
+    lab[:, :, 1:] = ab.transpose(1, 2, 0)
+    bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return bgr
+
+# -- Main function to run the training and testing --
+def main():
     
-    if not files:
-        raise RuntimeError(f"No image files found in {img_dir}. Please check the path and file extensions.")
+    # Load lab tensor from file
+    # Shape: (N, 3, 128, 128) where channel 0 = L*, 1 = a*, 2 = b*
+    lab_tensor = torch.load("lab_tensor.pt")
     
-    print(f"Found {len(files)} image files")
+    # 90% training, 10% testing
+    N = lab_tensor.shape[0]
+    n_train = int(0.9 * N) # counts how much data = 90% of it
+    perm = torch.randperm(N) # randomize data order
+    train_tensor = lab_tensor[perm[:n_train]] # first 90% training
+    test_tensor = lab_tensor[perm[n_train:]] # last 10 % testing
     
-    data = []
-    tensor_images = []
+    # Loaders to yield data in mini batches, shuffles training data
+    # pin_memory=True allows faster data transfer to GPU
+    train_loader = DataLoader(LabDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+    test_loader = DataLoader(LabDataset(test_tensor), batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
     
-    # Process images one by one and handle errors
-    for fl in files:
-        try:
-            img = cv2.imread(fl)
-            if img is None:
-                print(f"Warning: Could not load image {fl}")
-                continue
-                
-            tensor_img = create_tensor_img(img)
-            tensor_images.append(tensor_img)
-            data.append(img)  # Only append if successful
-        except Exception as e:
-            print(f"Error processing {fl}: {e}")
+    # Initialize model, loss function, and optimizer
+    model = ColorizationNet().to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    if not tensor_images:
-        raise RuntimeError("No images could be processed. Check file formats and permissions.")
+    print("Starting training...\n")
+    # pass over the entire dataset num_epochs times
+    for epoch in range(NUM_EPOCHS):
+        model.train() # Set to training mode
+        total_loss = 0
+        
+        # go over each batch of data to train
+        for L_batch, ab_batch in train_loader:
+            L_batch, ab_batch = L_batch.to(DEVICE), ab_batch.to(DEVICE) # Use GPU/CPU (whichever we're using)
+            optimizer.zero_grad() # Clear gradients
+            ab_pred = model(L_batch) # Use greyscale to predict a* and b*
+            loss = criterion(ab_pred, ab_batch) # Calculate loss using MSE
+            loss.backward() # Compute gradients using model parameters
+            optimizer.step() # Update weights
+            total_loss += loss.item() # Add loss to total
+            avg_loss = total_loss / len(train_loader)
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.4f}\n")
     
-    print(f"Successfully processed {len(tensor_images)} images")
+    # Save the model
+    torch.save(model.state_dict(), "colorization_model.pt")
+    print("Model saved as 'colorization_model.pt'")
     
-    # Turn into pytorch tensor
-    data_tensor = torch.stack(tensor_images)
+    # Inference
+    model.eval() # Set to evaluation mode
+    mse = nn.MSELoss() # loss function
+    total_mse = 0
     
-    # Randomly shuffle data
-    rand = torch.randperm(data_tensor.size(0))
-    data_tensor = data_tensor[rand]
+    print("\nTesting and saving colorized images...")
     
-    # -- Augmenting dataset --
-    augmented_tensor = []
-    for i, img in enumerate(data_tensor):
-        # create 10 augmentations for each original image
-        for j in range(10):
-            aug_img = augment_img(img, i * 10 + j)
-            augmented_tensor.append(aug_img)
+    # Turn off gradients for inference mode, no backpropagation needed and saves memory
+    num_images = 0 # total number of images
+    with torch.no_grad():
+        # Loops through each batch from test set
+        for i, (L_batch, ab_true) in enumerate(test_loader):
+            L_batch, ab_true = L_batch.to(DEVICE), ab_true.to(DEVICE)
+            ab_pred = model(L_batch) # Predict a* and b* channels
+            
+            # Calculate MSE for this batch
+            batch_mse = mse(ab_pred, ab_true).item()
+            total_mse += batch_mse * L_batch.size(0) # Multiply by number of images in batch
+            num_images += L_batch.size(0)
+            
+            # Save the images
+            for j in range(L_batch.shape[0]):
+                img_bgr = lab_to_bgr(L_batch[j], ab_pred[j])
+                idx = i * BATCH_SIZE + j
+                cv2.imwrite(f"colorized_outputs/img_{idx}.png", img_bgr)
     
-    # Turn into pytorch tensor
-    augmented_tensor = torch.stack(augmented_tensor)
-    
-    # -- Converting to L* a* b* Color Space --
-    lab_tensor = []
-    for i, img in enumerate(augmented_tensor):
-        lab_img = rgb_to_lab(img, i)
-        lab_tensor.append(lab_img)
-    
-    lab_tensor_stacked = torch.stack(lab_tensor)
-    torch.save(lab_tensor_stacked, "lab_tensor.pt")
-    
-    print("no. images: " + str(len(lab_tensor)))
-    print("DONE!")
+    # Report test MSE over all test images
+    avg_mse = total_mse / num_images
+    print(f"\nTest Set Mean Squared Error: {avg_mse:.4f}")
 
 if __name__ == "__main__":
     main()
