@@ -169,5 +169,264 @@ class ColorizationDataset(Dataset):
     
     def __getitem__(self, idx):
         try:
-            # Load the images in
+            # Load the images in grayscale mode
+            l_img = cv2.imread(self.l_paths[idx], cv2.IMREAD_GRAYSCALE)
+            a_img = cv2.imread(self.a_paths[idx], cv2.IMREAD_GRAYSCALE)
+            b_img = cv2.imread(self.b_paths[idx], cv2.IMREAD_GRAYSCALE)
+            
+            if l_img is None:
+                raise ValueError(f"Failed to load L image: {self.l_paths[idx]}")
+            if a_img is None:
+                raise ValueError(f"Failed to load a image: {self.a_paths[idx]}")
+            if b_img is None:
+                raise ValueError(f"Failed to load b image: {self.b_paths[idx]}")
+            
+            # (Optional) Warn if a or b images appear out-of-range; raw channels should be roughly 0-255.
+            if a_img.max() > 250 or a_img.min() < 5:
+                pass  # Data seems okay; adjust thresholds as needed
+            
+            # Normalize L channel (0-255 to 0-100)
+            l_img = l_img.astype(np.float32) / 255.0 * 100.0
+            
+            # Normalize a* and b* channels (0-255 to -128 to 127)
+            a_img = a_img.astype(np.float32) - 128
+            b_img = b_img.astype(np.float32) - 128
+            
+            # Combine a* and b* channels
+            ab_channels = np.stack([a_img, b_img], axis=2)
+            
+            # Apply transforms if any
+            if self.transform:
+                l_img = self.transform(l_img)
+                ab_channels = self.transform(ab_channels)
+            
+            # Convert to tensor and reshape
+            l_tensor = torch.from_numpy(l_img).unsqueeze(0)  # Add channel dimension
+            ab_tensor = torch.from_numpy(ab_channels).permute(2, 0, 1)  # HWC to CHW
+            
+            return l_tensor, ab_tensor
+            
+        except Exception as e:
+            print(f"Error loading image at index {idx}: {e}")
+            # Return a placeholder if there's an error
+            return torch.zeros((1, 100, 100)), torch.zeros((2, 100, 100))
+
+# Function to save images with fixed L channel scaling
+def save_colorized_images(model, test_loader, device):
+    model.eval()
+    with torch.no_grad():
+        for i, (l_img, _) in enumerate(test_loader):
+            l_img = l_img.to(device)
+            
+            # Get predictions
+            ab_pred = model(l_img)
+            
+            # Convert to numpy and prepare for visualization
+            l_numpy = l_img[0, 0].cpu().numpy()
+            a_numpy = ab_pred[0, 0].cpu().numpy() + 128  # Recenter a*
+            b_numpy = ab_pred[0, 1].cpu().numpy() + 128  # Recenter b*
+            
+            # Create LAB image with corrected L channel scaling:
+            # Rescale L from [0,100] to [0,255]
+            lab_img = np.zeros((l_numpy.shape[0], l_numpy.shape[1], 3), dtype=np.uint8)
+            lab_img[:, :, 0] = (np.clip(l_numpy, 0, 100) * (255.0/100.0)).astype(np.uint8)
+            lab_img[:, :, 1] = np.clip(a_numpy, 0, 255).astype(np.uint8)
+            lab_img[:, :, 2] = np.clip(b_numpy, 0, 255).astype(np.uint8)
+            
+            # Convert from LAB to RGB
+            rgb_img = cv2.cvtColor(lab_img, cv2.COLOR_Lab2BGR)
+            
+            # Save colorized image
+            output_path = os.path.join(COLORIZED_DIR, f"colorized_{i}.jpg")
+            cv2.imwrite(output_path, rgb_img)
+            
+            # Also save a comparison image for visualization
+            l_for_vis = cv2.cvtColor((np.clip(l_numpy, 0, 100) * (255.0/100.0)).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+            comparison = np.concatenate((l_for_vis, rgb_img), axis=1)
+            comparison_path = os.path.join(COLORIZED_DIR, f"comparison_{i}.jpg")
+            cv2.imwrite(comparison_path, comparison)
+            
+            print(f"Saved image {i} to {output_path}")
+
+def main():
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Hyperparameters
+    batch_size = 8  # Reduced batch size
+    num_epochs = 50
+    learning_rate = 0.001
+    n_downsample_layers = 5
+    
+    try:
+        # Load the dataset
+        dataset = ColorizationDataset(L_DIR, A_DIR, B_DIR)
+        
+        # Check if dataset has any samples
+        if len(dataset) == 0:
+            raise ValueError("Dataset has 0 samples. Please check the image directories.")
+        
+        # Adjust batch size if dataset is very small
+        if len(dataset) < batch_size:
+            batch_size = max(1, len(dataset) // 2)
+            print(f"Dataset has only {len(dataset)} samples. Using batch_size={batch_size}")
+        
+        # Split into train and test sets (90% train, 10% test)
+        dataset_size = len(dataset)
+        train_size = int(0.9 * dataset_size)
+        test_size = dataset_size - train_size
+        
+        # Ensure we have at least 1 sample in each split
+        if train_size < 1 or test_size < 1:
+            train_size = max(1, dataset_size - 1)
+            test_size = max(1, dataset_size - train_size)
+        
+        print(f"Splitting dataset: {train_size} training samples, {test_size} testing samples")
+        train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+        
+        # Create data loaders - use num_workers=0 to avoid multiprocessing issues during debugging
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+        
+        # Initialize the model
+        model = ColorizationModel(n_downsample_layers).to(device)
+        
+        # Loss and optimizer
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        
+        # Training loop
+        print("Starting training...")
+        for epoch in range(num_epochs):
+            model.train()
+            running_loss = 0.0
+            
+            for l_imgs, ab_imgs in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                l_imgs = l_imgs.to(device)
+                ab_imgs = ab_imgs.to(device)
+                
+                # Forward pass
+                ab_preds = model(l_imgs)
+                loss = criterion(ab_preds, ab_imgs)
+                
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()
+            
+            # Print statistics
+            epoch_loss = running_loss / len(train_loader)
+            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+            
+            # Evaluate and save images every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                model.eval()
+                test_loss = 0.0
+                with torch.no_grad():
+                    for l_imgs, ab_imgs in test_loader:
+                        l_imgs = l_imgs.to(device)
+                        ab_imgs = ab_imgs.to(device)
+                        
+                        ab_preds = model(l_imgs)
+                        loss = criterion(ab_preds, ab_imgs)
+                        test_loss += loss.item()
+                
+                test_loss /= len(test_loader)
+                print(f"Test Loss: {test_loss:.4f}")
+                
+                # Save intermediate colorization results
+                print(f"Saving intermediate results for epoch {epoch+1}...")
+                save_dir = os.path.join(COLORIZED_DIR, f"epoch_{epoch+1}")
+                os.makedirs(save_dir, exist_ok=True)
+                
+                # Save a few sample colorized images
+                with torch.no_grad():
+                    for i, (l_img, _) in enumerate(test_loader):
+                        if i >= 5:  # Save only a few samples
+                            break
+                            
+                        l_img = l_img.to(device)
+                        ab_pred = model(l_img)
+                        
+                        # Convert to numpy and prepare for visualization
+                        l_numpy = l_img[0, 0].cpu().numpy()
+                        a_numpy = ab_pred[0, 0].cpu().numpy() + 128
+                        b_numpy = ab_pred[0, 1].cpu().numpy() + 128
+                        
+                        # Create LAB image with corrected L scaling
+                        lab_img = np.zeros((l_numpy.shape[0], l_numpy.shape[1], 3), dtype=np.uint8)
+                        lab_img[:, :, 0] = (np.clip(l_numpy, 0, 100) * (255.0/100.0)).astype(np.uint8)
+                        lab_img[:, :, 1] = np.clip(a_numpy, 0, 255).astype(np.uint8)
+                        lab_img[:, :, 2] = np.clip(b_numpy, 0, 255).astype(np.uint8)
+                        
+                        # Convert from LAB to RGB
+                        rgb_img = cv2.cvtColor(lab_img, cv2.COLOR_Lab2BGR)
+                        
+                        # Save the image
+                        cv2.imwrite(os.path.join(save_dir, f"sample_{i}.jpg"), rgb_img)
+        
+        print("Training complete!")
+        
+        # Save the model
+        torch.save(model.state_dict(), os.path.join(COLORIZED_DIR, "colorization_model.pth"))
+        
+        # Generate and save colorized images
+        print("Generating colorized images...")
+        save_colorized_images(model, test_loader, device)
+        print(f"Colorized images saved to {COLORIZED_DIR} directory")
+    
+    except Exception as e:
+        print(f"Error during training: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Re-training block (if needed)
+    model = ColorizationModel(n_downsample_layers).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    print("Starting re-training...")
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        
+        for l_imgs, ab_imgs in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            l_imgs = l_imgs.to(device)
+            ab_imgs = ab_imgs.to(device)
+            
+            ab_preds = model(l_imgs)
+            loss = criterion(ab_preds, ab_imgs)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        
+        epoch_loss = running_loss / len(train_loader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+        
+        if (epoch + 1) % 5 == 0:
+            model.eval()
+            test_loss = 0.0
+            with torch.no_grad():
+                for l_imgs, ab_imgs in test_loader:
+                    l_imgs = l_imgs.to(device)
+                    ab_imgs = ab_imgs.to(device)
+                    ab_preds = model(l_imgs)
+                    loss = criterion(ab_preds, ab_imgs)
+                    test_loss += loss.item()
+            test_loss /= len(test_loader)
+            print(f"Test Loss: {test_loss:.4f}")
+    
+    print("Re-training complete!")
+    torch.save(model.state_dict(), os.path.join(COLORIZED_DIR, "colorization_model.pth"))
+    print("Model saved.")
+    
+    print("Generating final colorized images...")
+    save_colorized_images(model, test_loader, device)
+    print(f"Colorized images saved to {COLORIZED_DIR} directory")
+
+if __name__ == "__main__":
+    main()
 
