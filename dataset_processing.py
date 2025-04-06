@@ -1,181 +1,185 @@
-# -- Initial Setup --
-import cv2
 import os
 import glob
+import cv2
 import torch
 import numpy as np
-import random
-import shutil
+from pathlib import Path
 
-# torch.set_default_tensor_type('torch.FloatTensor') # Deprecated
+# ---------------------------------------------------------------
+# 0) Configure torch to use 32-bit floating point precision initially
 torch.set_default_dtype(torch.float32)
+# Alternative approach: torch.setdefaulttensortype('torch.FloatTensor')
 
-def create_tensor_img(img):
-    """
-    Prepares image to be put into tensor
-    """
-    img = cv2.resize(img, (128, 128)) # resize to 128 x 128
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # convert to RGB
-    img = img.astype(np.float32) / 255.0 # Normalize to [0, 1]
-    img = torch.from_numpy(img).permute(2, 0, 1) # convert to tensor from numpy, change the order of the dimensions from from (H, W, C) to (C, H, W)
-    return img
+# ---------------------------------------------------------------
+# 1) Import and Randomize the Source Dataset
+image_pattern = "/DATA/ahmedabouelnaga/DL-Project-2/face_images/*.jpg"
+image_files = glob.glob(image_pattern)
+print(f"Located {len(image_files)} facial images.")
 
-def augment_img(tensor_img, index, output_dir="augmented"):
-    """
-    Augments an image
-    
-    Random cropping is done as follows:
-    Randomly choosing a crop window of 80%-100% height/width, and placing it randomly within the full height/width. 
-    The top/left value is constrained so that the crop fits inside the image
-    """
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    img = tensor_img.permute(1, 2, 0).numpy() # tensor to numpy with columns ordered as H, W, C
-    
-    # Random horizontal flip (50/50)
-    if random.random() < 0.5:
-        img = cv2.flip(img, 1)
-    
-    # Random cropping
-    h, w, _ = img.shape
-    crop_scale = random.uniform(0.8, 1.0)
-    new_h, new_w = int(h * crop_scale), int(w * crop_scale)
-    top = random.randint(0, h - new_h) # picks new starting point from top for crop
-    left = random.randint(0, w - new_w) # picks new starting point from left for crop
-    img = img[top:top+new_h, left:left+new_w] # crop the data
-    img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_AREA) #resize back to input size
-    
-    # RGB value scaling
-    rgb_scale = random.uniform(0.6, 1.0) # scale factor used to darken
-    img = np.clip(img * rgb_scale, 0, 1)
-    
-    # For saving only
-    img_save = (img * 255).astype(np.uint8)
-    cv2.imwrite(f"{output_dir}/aug_{index:04d}.jpg", cv2.cvtColor(img_save, cv2.COLOR_RGB2BGR))
-    
-    return torch.from_numpy(img).permute(2, 0, 1) #reorder back to C, H, W
+resize_dimensions = (128, 128)  # Standard size for all images
 
-def rgb_to_lab(rgb_tensor, index):
-    """
-    Convert RGB to LAB
-    """
-    
-    os.makedirs("augmented_lab", exist_ok=True)
-    os.makedirs("L", exist_ok=True)
-    os.makedirs("a", exist_ok=True)
-    os.makedirs("b", exist_ok=True)
-    
-    rgb = rgb_tensor.permute(1, 2, 0).numpy() # shape: [H, W, 3]
-    rgb = (rgb * 255).astype(np.uint8)
-    
-    # Convert RGB to LAB
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    
-    # Save the full LAB image
-    lab_filename = f"augmented_lab/lab_{index:04d}.png"
-    cv2.imwrite(lab_filename, lab)
-    
-    # Split the channels
-    L, A, B = cv2.split(lab)
-    
-    # Save L
-    cv2.imwrite(f"L/L_{index:04d}.png", L)
-    
-    # Create green-magenta a
-    lab_a_only = cv2.merge([np.full_like(L, 128), A, np.full_like(B, 128)]) # set L and B to neural constant 128 and keep A
-    a_color = cv2.cvtColor(lab_a_only, cv2.COLOR_LAB2RGB)
-    cv2.imwrite(f"a/a_{index:04d}.png", cv2.cvtColor(a_color, cv2.COLOR_RGB2BGR))
-    
-    # Create blue-yellow b
-    lab_b_only = cv2.merge([np.full_like(L, 128), np.full_like(A, 128), B])
-    b_color = cv2.cvtColor(lab_b_only, cv2.COLOR_LAB2RGB) # true blue→yellow
-    cv2.imwrite(f"b/b_{index:04d}.png", cv2.cvtColor(b_color, cv2.COLOR_RGB2BGR))
-    
-    # convert LAB back to store it
-    lab_float = lab.astype(np.float32)
-    lab_tensor = torch.from_numpy(lab_float).permute(2, 0, 1)
-    
-    return lab_tensor
+image_collection = []
+for image_path in image_files:
+    image = cv2.imread(image_path)  # CV2 uses BGR format
+    if image is None:
+        print(f"Warning: Could not load {image_path}")
+        continue
+    normalized_image = cv2.resize(image, resize_dimensions)
+    image_collection.append(normalized_image)
 
-def reset_output_dirs():
-    """
-    Clears output directories
-    """
-    dirs = ["augmented", "augmented_lab", "L", "a", "b"]
-    for dir_path in dirs:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
-        os.makedirs(dir_path)
+# Transform to numpy format => dimensions: (N, 128, 128, 3)
+image_array = np.array(image_collection)
+print("Dataset dimensions:", image_array.shape)
 
-def main():
-    """
-    Main function to run the script
-    """
-    
-    # -- Clear data from previous directories --
-    reset_output_dirs()
-    
-    # -- Loading data --
-    base_dir = "/DATA/ahmedabouelnaga/DL-Project-2/"
-    img_dir_pattern = os.path.join(base_dir, "face_images/*.jpg")
-    files = glob.glob(img_dir_pattern)
-    print(f"Found {len(files)} images.")
-    
-    data = []
-    
-    # Adds all the pictures to data array
-    for fl in files:
-        img = cv2.imread(fl)
-        if img is None:
-            print(f"Warning: Could not read image {fl}")
-            continue
-        data.append(img)
-    
-    print(f"Successfully loaded {len(data)} images.")
-    
-    # -- Creating Tensor --
-    tensor_images = []
-    for img in data:
-        tensor_img = create_tensor_img(img)
-        tensor_images.append(tensor_img)
-    
-    # Turn into pytorch tensor
-    data_tensor = torch.stack(tensor_images)
-    
-    # Randomly shuffle data
-    rand = torch.randperm(data_tensor.size(0))
-    data_tensor = data_tensor[rand]
-    
-    print(f"Created tensor with shape: {data_tensor.shape}")
-    
-    # -- Augmenting dataset --
-    augmentation_factor = 10
-    augmented_tensor = []
-    for i, img in enumerate(data_tensor):
-        # create 10 augmentations for each original image
-        for j in range(augmentation_factor):
-            aug_img = augment_img(img, i * augmentation_factor + j)
-            augmented_tensor.append(aug_img)
-    
-    # Turn into pytorch tensor
-    augmented_tensor = torch.stack(augmented_tensor)
-    print(f"Created augmented tensor with shape: {augmented_tensor.shape}")
-    
-    # -- Converting to L* a* b* Color Space --
-    lab_tensor = []
-    for i, img in enumerate(augmented_tensor):
-        lab_img = rgb_to_lab(img, i)
-        lab_tensor.append(lab_img)
-    
-    lab_tensor_stacked = torch.stack(lab_tensor)
-    torch.save(lab_tensor_stacked, "lab_tensor.pt")
-    
-    print(f"Number of images: {len(lab_tensor)}")
-    print("All done!")
-    print("1) Augmented (RGB) images in 'augmented/'")
-    print("2) LAB images in 'augmented_lab/'")
-    print("3) L*, a*, b* channel images in 'L/', 'a/', 'b/' respectively.")
+# Convert to PyTorch tensor => dimensions: (N, 3, 128, 128)
+image_tensor = torch.from_numpy(image_array).permute(0, 3, 1, 2).float()
 
-if __name__ == "__main__":
-    main()
+# Randomize order
+sample_count = image_tensor.size(0)
+random_indices = torch.randperm(sample_count)
+image_tensor = image_tensor[random_indices]
+
+# ---------------------------------------------------------------
+# 2) Expand the Dataset with Augmentation
+#    - Mirror flip (50% probability)
+#    - Dynamic cropping and resize
+#    - RGB intensity adjustment [0.6, 1.0]
+
+expansion_multiplier = 10
+enhanced_images = []  # will store the augmented images as BGR uint8
+
+def crop_randomly_and_resize(image_bgr, target_dimensions=(128, 128), scale_min=0.8):
+    """
+    Creates a random crop at a scale between [scale_min,1.0],
+    then resizes to target_dimensions.
+    """
+    height, width, _ = image_bgr.shape
+    scale_factor = np.random.uniform(scale_min, 1.0)
+    crop_height = int(height * scale_factor)
+    crop_width = int(width * scale_factor)
+    # Calculate valid position ranges
+    y_range = height - crop_height
+    x_range = width - crop_width
+    top = np.random.randint(0, y_range+1) if y_range > 0 else 0
+    left = np.random.randint(0, x_range+1) if x_range > 0 else 0
+    cropped = image_bgr[top:top+crop_height, left:left+crop_width]
+    return cv2.resize(cropped, target_dimensions)
+
+for idx in range(image_tensor.size(0)):
+    # Transform to (128,128,3) uint8 for CV2 operations
+    source_image = image_tensor[idx].permute(1, 2, 0).numpy().astype(np.uint8)
+    
+    for i in range(expansion_multiplier):
+        modified = source_image.copy()
+        
+        # 2a) Mirror flip (50% probability)
+        if np.random.random() > 0.5:
+            modified = cv2.flip(modified, 1)
+        
+        # 2b) Dynamic cropping with resize
+        modified = crop_randomly_and_resize(modified, target_dimensions=resize_dimensions, scale_min=0.8)
+        
+        # 2c) Adjust RGB intensity by [0.6, 1.0]
+        intensity_factor = np.random.uniform(0.6, 1.0)
+        modified = np.clip(modified * intensity_factor, 0, 255).astype(np.uint8)
+        
+        enhanced_images.append(modified)
+
+enhanced_images = np.array(enhanced_images)  # dimensions: (N*10, 128, 128, 3)
+print("Augmented dataset dimensions:", enhanced_images.shape)
+
+# ---------------------------------------------------------------
+# 3) Store the Enhanced Dataset (RGB) BEFORE LAB Transformation
+#    Save to directory named "augmented/"
+Path("augmented").mkdir(exist_ok=True)
+for i, img_bgr in enumerate(enhanced_images):
+    cv2.imwrite(f"augmented/enhanced_{i:04d}.jpg", img_bgr)
+
+# ---------------------------------------------------------------
+# 4) Transform to L*a*b* and Store the Enhanced LAB Dataset
+#    Create separate channels for L* (intensity), 
+#    a* (green-magenta spectrum) and b* (blue-yellow spectrum)
+
+Path("augmented_lab").mkdir(exist_ok=True)  # Complete LAB images
+Path("L").mkdir(exist_ok=True)
+Path("a").mkdir(exist_ok=True)
+Path("b").mkdir(exist_ok=True)
+
+def visualize_a_channel(a_channel):
+    """
+    Converts a_channel [0..255] to a visual representation
+    where 128 is neutral, <128 is green, >128 is magenta.
+    
+    Calculation:
+      normalized = (a - 128)/128  range [-1..1]
+      alpha = (normalized + 1)/2  range [0..1]
+      Blue = 255 * alpha
+      Green = 255 * (1 - alpha)
+      Red = 255 * alpha
+    Creates gradient: green (0,255,0) -> magenta (255,0,255)
+    """
+    a_normalized = (a_channel.astype(np.float32) - 128.0) / 128.0  # [-1..1]
+    alpha = (a_normalized + 1.0) / 2.0  # [0..1]
+    
+    # Create BGR channels [0..255]
+    blue = 255.0 * alpha
+    green = 255.0 * (1.0 - alpha)
+    red = 255.0 * alpha
+    
+    # Combine into BGR image
+    visualization = np.dstack([blue, green, red]).astype(np.uint8)
+    return visualization
+
+def visualize_b_channel(b_channel):
+    """
+    Converts b_channel [0..255] to a visual representation
+    where 128 is neutral, <128 is blue, >128 is yellow.
+    
+    Calculation:
+      normalized = (b - 128)/128  range [-1..1]
+      alpha = (normalized + 1)/2  range [0..1]
+      Blue = 255 * (1 - alpha)
+      Green = 255 * alpha
+      Red = 255 * alpha
+    Creates gradient: blue (255,0,0) -> yellow (0,255,255)
+    """
+    b_normalized = (b_channel.astype(np.float32) - 128.0) / 128.0  # [-1..1]
+    alpha = (b_normalized + 1.0) / 2.0  # [0..1]
+    
+    blue = 255.0 * (1.0 - alpha)
+    green = 255.0 * alpha
+    red = 255.0 * alpha
+    
+    visualization = np.dstack([blue, green, red]).astype(np.uint8)
+    return visualization
+
+for i, img_bgr in enumerate(enhanced_images):
+    # Transform BGR -> LAB
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    
+    # Save complete LAB image
+    lab_filename = f"augmented_lab/lab_{i:04d}.png"
+    cv2.imwrite(lab_filename, img_lab)
+    
+    # Extract L*, a*, b* channels
+    L_channel, a_channel, b_channel = cv2.split(img_lab)
+    
+    # --- Save L* channel as grayscale ---
+    # L* already in 0..255 range in OpenCV
+    L_filename = f"L/L_{i:04d}.png"
+    cv2.imwrite(L_filename, L_channel)
+    
+    # --- Save a* channel with green-magenta visualization ---
+    a_visual = visualize_a_channel(a_channel)
+    a_filename = f"a/a_{i:04d}.png"
+    cv2.imwrite(a_filename, a_visual)
+    
+    # --- Save b* channel with blue-yellow visualization ---
+    b_visual = visualize_b_channel(b_channel)
+    b_filename = f"b/b_{i:04d}.png"
+    cv2.imwrite(b_filename, b_visual)
+
+print("Processing complete!")
+print("1) Enhanced RGB images saved to 'augmented/'")
+print("2) LAB converted images saved to 'augmented_lab/'") 
+print("3) Channel visualizations saved to 'L/', 'a/', and 'b/' folders.")
