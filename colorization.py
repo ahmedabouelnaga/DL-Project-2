@@ -1,418 +1,175 @@
-
-import os
-import cv2
-import glob
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-import torchvision.transforms as transforms
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import cv2
+import os
 
+# -- Configuration --
 
-# Setup Directories
+# Set batch size, learning rate, and number of epochs
+BATCH_SIZE = 10
+LEARNING_RATE = 1e-3
+NUM_EPOCHS = 20
 
-L_DIR = "./L"  # Directory for L* channel images
-A_DIR = "./a"  # Directory for a* channel images
-B_DIR = "./b"  # Directory for b* channel images
-COLORIZED_DIR = "./colorization"  # Output directory for colorized images
-os.makedirs(COLORIZED_DIR, exist_ok=True)
+# Part 4: GPU Computing code
+# Use CUDA if it is available (otherwise we're running on our PCs)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}") # check if CUDA is being used
+os.makedirs("colorized_outputs", exist_ok=True) # directory for output
 
-print(f"Current working directory: {os.getcwd()}")
-print(f"L directory exists: {os.path.exists(L_DIR)}")
-print(f"a directory exists: {os.path.exists(A_DIR)}")
-print(f"b directory exists: {os.path.exists(B_DIR)}")
+# -- Dataset wrapper class for preparation and easy retrival --
 
+class LabDataset(Dataset):
+    def __init__(self, data_tensor):
+        # Normalize L* from [0, 100] to [0, 1], ab from [-128, 127] to [-1, 1]
+        self.L = data_tensor[:, 0:1] / 100.0
+        self.ab = data_tensor[:, 1:3] / 128.0
+    
+    def __len__(self):
+        # returns number of items in dataset
+        return self.L.shape[0]
+    
+    def __getitem__(self, idx):
+        # gets a specific sample given the index
+        return self.L[idx], self.ab[idx]
 
-# Colorization Model
+# -- Model class --
 
-class ColorizationModel(nn.Module):
-    def __init__(self, n_downsample_layers=5):
-        super(ColorizationModel, self).__init__()
-        # Initial feature extraction
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu1 = nn.ReLU(inplace=True)
+class ColorizationNet(nn.Module):
+    def __init__(self):
+        # define network layers
+        super(ColorizationNet, self).__init__()
         
-        # Downsampling layers
-        self.down_layers = nn.ModuleList()
-        resolutions = [64, 128, 256, 512, 512]
-        for i in range(n_downsample_layers - 1):
-            in_channels = resolutions[i]
-            out_channels = resolutions[i+1]
-            down_block = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(out_channels),
+        def down_block(in_ch, out_ch):
+            # convolution block that downsamples (halves resolution)
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch), # normalizes the output of the previous layer
+                nn.ReLU(inplace=True), # introduce non-linearity
+                nn.MaxPool2d(2) # reduces spatial resolution by half
+            )
+        
+        def up_block(in_ch, out_ch):
+            # convolution block that upsamples (doubles resolution)
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True)
             )
-            self.down_layers.append(down_block)
         
-        # Upsampling layers with skip connections
-        self.up_layers = nn.ModuleList()
-        for i in range(n_downsample_layers - 1, 0, -1):
-            in_channels = resolutions[i]
-            out_channels = resolutions[i-1]
-            up_block = nn.Sequential(
-                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            )
-            self.up_layers.append(up_block)
+        # Encoder: reduces spatial resolution
+        self.encoder = nn.Sequential(
+            down_block(1, 64),    # 128 to 64
+            down_block(64, 128),  # 64 to 32
+            down_block(128, 256), # 32 to 16
+            down_block(256, 512), # 16 to 8
+            down_block(512, 512)  # 8 to 4
+        )
         
-        # Final output layer: produce a* and b* channels
-        self.output_conv = nn.Conv2d(64, 2, kernel_size=3, stride=1, padding=1)
-        self.output_tanh = nn.Tanh()  # Constrain output to [-1, 1]
-        
+        # Decoder: restores resolution while dropping channels
+        self.decoder = nn.Sequential(
+            up_block(512, 512),  # spatial resolution going from 4 to 8
+            up_block(512, 256),  # 8 to 16
+            up_block(256, 128),  # 16 to 32
+            up_block(128, 64),   # 32 to 64
+            up_block(64, 32),    # 64 to 128
+            # (batch_size, 32, 128, 128) to (batch_size, 2, 128, 128) for a* and b* channels
+            nn.Conv2d(32, 2, kernel_size=3, padding=1)
+        )
+    
     def forward(self, x):
-        x = self.relu1(self.bn1(self.conv1(x)))
-        skip_connections = [x]
-        for down_layer in self.down_layers:
-            x = down_layer(x)
-            skip_connections.append(x)
-        skip_connections.pop()  # Remove bottleneck skip
-        
-        for up_layer in self.up_layers:
-            x = up_layer(x)
-            skip = skip_connections.pop()
-            x = x + skip  # Skip connection via element-wise addition
-        
-        x = self.output_conv(x)
-        x = self.output_tanh(x)
-        x = x * 127  # Scale output: Tanh gives [-1,1], so multiply by 127
-        return x
+        # Returns the output of encoding and decoding
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x  # Output: (batch_size, 2, 128, 128)
 
+# -- Helper function to convert LAB to BGR for saving images --
+def lab_to_bgr(L, ab):
+    L = (L.squeeze().cpu().numpy() * 100).astype(np.uint8)
+    ab = (ab.squeeze().cpu().numpy() * 128).astype(np.int8)
+    lab = np.zeros((128, 128, 3), dtype=np.uint8)
+    lab[:, :, 0] = L
+    lab[:, :, 1:] = ab.transpose(1, 2, 0)
+    bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return bgr
 
-# Custom Dataset for Colorization - MODIFIED to handle visualized a/b channels
-
-class ColorizationDataset(Dataset):
-    def __init__(self, l_dir, a_dir, b_dir, transform=None):
-        self.l_paths = sorted(glob.glob(os.path.join(l_dir, "*.*")))
-        self.a_paths = sorted(glob.glob(os.path.join(a_dir, "*.*")))
-        self.b_paths = sorted(glob.glob(os.path.join(b_dir, "*.*")))
-        
-        if len(self.l_paths) == 0 or len(self.a_paths) == 0 or len(self.b_paths) == 0:
-            raise ValueError("One or more directories are empty. Please check the paths.")
-        
-        self.dataset_size = min(len(self.l_paths), len(self.a_paths), len(self.b_paths))
-        self.l_paths = self.l_paths[:self.dataset_size]
-        self.a_paths = self.a_paths[:self.dataset_size]
-        self.b_paths = self.b_paths[:self.dataset_size]
-        self.transform = transform
-        
-        print(f"Using {self.dataset_size} images for training and testing.")
-    
-    def __len__(self):
-        return self.dataset_size
-    
-    def __getitem__(self, idx):
-        try:
-            # Load L channel as grayscale
-            l_img = cv2.imread(self.l_paths[idx], cv2.IMREAD_GRAYSCALE)
-            
-            # Load a and b images - they're visualizations, not raw a/b channels
-            a_vis = cv2.imread(self.a_paths[idx])
-            b_vis = cv2.imread(self.b_paths[idx])
-            
-            if l_img is None or a_vis is None or b_vis is None:
-                raise ValueError(f"Error loading image at index {idx}")
-            
-            # Reverse the a* channel visualization (green-magenta)
-            # Extract true a* channel from visualization
-            # The visualization used: 
-            #   a_val = 128 + (128 * normalized_val)  where normalized_val is in [-1, 1]
-            # For green, B=0, G=255, R=0, which means alpha=0, which means normalized_val=-1, a_val=0
-            # For magenta, B=255, G=0, R=255, which means alpha=1, which means normalized_val=1, a_val=255
-            
-            # First, convert to HSV to detect the color
-            a_hsv = cv2.cvtColor(a_vis, cv2.COLOR_BGR2HSV)
-            h, s, v = cv2.split(a_hsv)
-            
-            # Create an empty a* channel
-            a_channel = np.zeros_like(l_img, dtype=np.float32)
-            
-            # Green has H around 60 (in OpenCV, 30 in 0-180 scale), Magenta has H around 300 (in OpenCV, 150 in 0-180 scale)
-            # We use the hue to determine where we are in the green-magenta spectrum
-            # Higher H values correspond to higher a* (more magenta)
-            # We need to map hue 30 (green) to a*=0 and hue 150 (magenta) to a*=255
-            
-            # Simplified approach: linear mapping from hue to a*
-            # Magenta is actually between 150-170 in OpenCV's H space
-            # Normalize the hue from magenta-green spectrum to a* range
-            a_channel = np.interp(h.astype(float), [30, 150], [0, 255])
-            
-            # Same for b* channel - blue to yellow
-            b_hsv = cv2.cvtColor(b_vis, cv2.COLOR_BGR2HSV)
-            h, s, v = cv2.split(b_hsv)
-            
-            # Blue has H around 240 (in OpenCV, 120 in 0-180 scale), Yellow has H around 60 (in OpenCV, 30 in 0-180 scale)
-            # Higher H values correspond to lower b* (more blue)
-            b_channel = np.interp(h.astype(float), [120, 30], [0, 255])
-            
-            # Normalize L channel (0-255 to 0-100)
-            l_img = l_img.astype(np.float32) / 255.0 * 100.0
-            
-            # Normalize a and b channels: subtract 128 to center
-            a_channel = a_channel.astype(np.float32) - 128.0
-            b_channel = b_channel.astype(np.float32) - 128.0
-            
-            # Apply transforms if any
-            if self.transform:
-                l_img = self.transform(l_img)
-            else:
-                l_img = np.expand_dims(l_img, axis=0)  # shape (1, H, W)
-            
-            # For training the colorization model, targets are the estimated a and b channels
-            ab_channels = np.stack([a_channel, b_channel], axis=2)  # shape (H, W, 2)
-            ab_channels = ab_channels.transpose(2, 0, 1)      # shape (2, H, W)
-            
-            l_tensor = torch.from_numpy(l_img)
-            ab_tensor = torch.from_numpy(ab_channels)
-            return l_tensor, ab_tensor
-            
-        except Exception as e:
-            print(f"Error loading image at index {idx}: {e}")
-            # Return a placeholder if there's an error
-            return torch.zeros((1, 100, 100)), torch.zeros((2, 100, 100))
-
-
-# Alternative Dataset (SIMPLER)
-
-class SimpleColorizationDataset(Dataset):
-    def __init__(self, l_dir, a_dir, b_dir, transform=None):
-        self.l_paths = sorted(glob.glob(os.path.join(l_dir, "*.*")))
-        self.a_paths = sorted(glob.glob(os.path.join(a_dir, "*.*")))
-        self.b_paths = sorted(glob.glob(os.path.join(b_dir, "*.*")))
-        
-        if len(self.l_paths) == 0 or len(self.a_paths) == 0 or len(self.b_paths) == 0:
-            raise ValueError("One or more directories are empty. Please check the paths.")
-        
-        self.dataset_size = min(len(self.l_paths), len(self.a_paths), len(self.b_paths))
-        self.l_paths = self.l_paths[:self.dataset_size]
-        self.a_paths = self.a_paths[:self.dataset_size]
-        self.b_paths = self.b_paths[:self.dataset_size]
-        self.transform = transform
-        
-        print(f"Using {self.dataset_size} images for training and testing.")
-        
-        # Instead of trying to extract the a*b* values from the visualizations,
-        # we'll generate random a*b* values for training. This is a simpler approach
-        # for learning colorization, though it won't reproduce the original colors.
-    
-    def __len__(self):
-        return self.dataset_size
-    
-    def __getitem__(self, idx):
-        try:
-            # Load L channel as grayscale
-            l_img = cv2.imread(self.l_paths[idx], cv2.IMREAD_GRAYSCALE)
-            
-            if l_img is None:
-                raise ValueError(f"Error loading L image at index {idx}")
-            
-            # Get image dimensions
-            h, w = l_img.shape
-            
-            # Create synthetic a*b* channels with softened edges
-            # First get edges from L channel
-            edges = cv2.Canny(l_img, 50, 150)
-            edges = cv2.dilate(edges, np.ones((5,5), np.uint8))
-            edges = 255 - edges  # Invert so edges are 0, non-edges are 255
-            
-            # Blur to get a smoother mask
-            edges = cv2.GaussianBlur(edges, (21, 21), 0)
-            edges = edges.astype(np.float32) / 255.0  # Normalize to [0, 1]
-            
-            # Create random a*b* values but use edge information to control variation
-            # Generate base random values
-            a_random = np.random.normal(0, 30, (h, w)).astype(np.float32)
-            b_random = np.random.normal(0, 30, (h, w)).astype(np.float32)
-            
-            # Create semantic-based colors
-            # Skin tone tendencies in a*b* space
-            a_skin = np.ones((h, w), dtype=np.float32) * 15  # slightly reddish
-            b_skin = np.ones((h, w), dtype=np.float32) * 30  # slightly yellowish
-            
-            # Clothing tendencies - more varied
-            a_cloth = np.random.uniform(-60, 60, (h, w)).astype(np.float32)
-            b_cloth = np.random.uniform(-60, 60, (h, w)).astype(np.float32)
-            
-            # Face detection would be ideal here, but let's use a simple heuristic:
-            # Assume the face is more likely to be in the center-top of the image
-            face_mask = np.zeros((h, w), dtype=np.float32)
-            # Create an elliptical mask
-            center_y, center_x = int(h * 0.35), int(w * 0.5)  # center at 35% from top
-            axes_length = (int(w * 0.3), int(h * 0.2))  # ellipse size
-            cv2.ellipse(face_mask, (center_x, center_y), axes_length, 0, 0, 360, 1, -1)
-            
-            # Apply Gaussian blur to soften the mask
-            face_mask = cv2.GaussianBlur(face_mask, (51, 51), 0)
-            
-            # Combine random with semantic colors using masks
-            a_channel = a_random * (1 - face_mask - edges) + a_skin * face_mask + edges * 0
-            b_channel = b_random * (1 - face_mask - edges) + b_skin * face_mask + edges * 0
-            
-            # Normalize L channel (0-255 to 0-100)
-            l_img = l_img.astype(np.float32) / 255.0 * 100.0
-            
-            # Apply transforms if any
-            if self.transform:
-                l_img = self.transform(l_img)
-            else:
-                l_img = np.expand_dims(l_img, axis=0)  # shape (1, H, W)
-            
-            # For training the colorization model, targets are the estimated a and b channels
-            ab_channels = np.stack([a_channel, b_channel], axis=2)  # shape (H, W, 2)
-            ab_channels = ab_channels.transpose(2, 0, 1)      # shape (2, H, W)
-            
-            l_tensor = torch.from_numpy(l_img)
-            ab_tensor = torch.from_numpy(ab_channels)
-            return l_tensor, ab_tensor
-            
-        except Exception as e:
-            print(f"Error loading image at index {idx}: {e}")
-            # Return a placeholder if there's an error
-            return torch.zeros((1, 100, 100)), torch.zeros((2, 100, 100))
-
-
-# Utility Function to Save Colorized Images
-
-def save_colorized_images(model, test_loader, device):
-    model.eval()
-    with torch.no_grad():
-        for i, (l_img, _) in enumerate(test_loader):
-            l_img = l_img.to(device)
-            ab_pred = model(l_img)
-            # Prepare data for visualization
-            l_numpy = l_img[0, 0].cpu().numpy()
-            a_numpy = ab_pred[0, 0].cpu().numpy() + 128  # Offset a channel back to 0-255
-            b_numpy = ab_pred[0, 1].cpu().numpy() + 128  # Offset b channel back to 0-255
-            
-            # Create LAB image: scale L from [0,100] to [0,255] for cv2.cvtColor
-            lab_img = np.zeros((l_numpy.shape[0], l_numpy.shape[1], 3), dtype=np.uint8)
-            lab_img[:, :, 0] = np.clip(l_numpy * (255.0/100.0), 0, 255).astype(np.uint8)
-            lab_img[:, :, 1] = np.clip(a_numpy, 0, 255).astype(np.uint8)
-            lab_img[:, :, 2] = np.clip(b_numpy, 0, 255).astype(np.uint8)
-            
-            # Convert LAB to BGR for visualization
-            rgb_img = cv2.cvtColor(lab_img, cv2.COLOR_Lab2BGR)
-            
-            # Save colorized image and comparison image (input vs. colorized)
-            output_path = os.path.join(COLORIZED_DIR, f"colorized_{i}.jpg")
-            cv2.imwrite(output_path, rgb_img)
-            
-            # Create comparison image - grayscale and colorized side by side
-            l_for_vis = cv2.cvtColor(np.clip(l_numpy * (255.0/100.0), 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            comparison = np.concatenate((l_for_vis, rgb_img), axis=1)
-            comparison_path = os.path.join(COLORIZED_DIR, f"comparison_{i}.jpg")
-            cv2.imwrite(comparison_path, comparison)
-            print(f"Saved image {i} to {output_path}")
-
-
-# Main Routine
-
+# -- Main function to run the training and testing --
 def main():
-    # Set device configuration
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
     
-    # Hyperparameters
-    batch_size = 8
-    num_epochs = 50
-    learning_rate = 0.001
-    n_downsample_layers = 5
+    # Load lab tensor from file
+    # Shape: (N, 3, 128, 128) where channel 0 = L*, 1 = a*, 2 = b*
+    lab_tensor = torch.load("lab_tensor.pt")
     
-    try:
-        # *** Change this line to use the alternative dataset ***
-        # dataset = ColorizationDataset(L_DIR, A_DIR, B_DIR)
-        dataset = SimpleColorizationDataset(L_DIR, A_DIR, B_DIR)
+    # 90% training, 10% testing
+    N = lab_tensor.shape[0]
+    n_train = int(0.9 * N) # counts how much data = 90% of it
+    perm = torch.randperm(N) # randomize data order
+    train_tensor = lab_tensor[perm[:n_train]] # first 90% training
+    test_tensor = lab_tensor[perm[n_train:]] # last 10 % testing
+    
+    # Loaders to yield data in mini batches, shuffles training data
+    # pin_memory=True allows faster data transfer to GPU
+    train_loader = DataLoader(LabDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+    test_loader = DataLoader(LabDataset(test_tensor), batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
+    
+    # Initialize model, loss function, and optimizer
+    model = ColorizationNet().to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    print("Starting training...\n")
+    # pass over the entire dataset num_epochs times
+    for epoch in range(NUM_EPOCHS):
+        model.train() # Set to training mode
+        total_loss = 0
         
-        if len(dataset) == 0:
-            raise ValueError("Dataset has 0 samples. Please check the image directories.")
-        
-        # Adjust batch size if dataset is small
-        if len(dataset) < batch_size:
-            batch_size = max(1, len(dataset) // 2)
-            print(f"Dataset has only {len(dataset)} samples. Using batch_size={batch_size}")
-        
-        # Split dataset: 90% training, 10% testing.
-        dataset_size = len(dataset)
-        train_size = int(0.9 * dataset_size)
-        test_size = dataset_size - train_size
-        train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-        print(f"Split dataset: {train_size} training samples, {test_size} testing samples")
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
-        
-        # Initialize model, loss function, and optimizer.
-        model = ColorizationModel(n_downsample_layers).to(device)
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        
-        # Training loop (single loop only)
-        print("Starting training...")
-        for epoch in range(num_epochs):
-            model.train()
-            running_loss = 0.0
-            for l_imgs, ab_imgs in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-                l_imgs = l_imgs.to(device)
-                ab_imgs = ab_imgs.to(device)
-                optimizer.zero_grad()
-                ab_preds = model(l_imgs)
-                loss = criterion(ab_preds, ab_imgs)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
+        # go over each batch of data to train
+        for L_batch, ab_batch in train_loader:
+            L_batch, ab_batch = L_batch.to(DEVICE), ab_batch.to(DEVICE) # Use GPU/CPU (whichever we're using)
+            optimizer.zero_grad() # Clear gradients
+            ab_pred = model(L_batch) # Use greyscale to predict a* and b*
+            loss = criterion(ab_pred, ab_batch) # Calculate loss using MSE
+            loss.backward() # Compute gradients using model parameters
+            optimizer.step() # Update weights
+            total_loss += loss.item() # Add loss to total
+            avg_loss = total_loss / len(train_loader)
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.4f}\n")
+    
+    # Save the model
+    torch.save(model.state_dict(), "colorization_model.pt")
+    print("Model saved as 'colorization_model.pt'")
+    
+    # Inference
+    model.eval() # Set to evaluation mode
+    mse = nn.MSELoss() # loss function
+    total_mse = 0
+    
+    print("\nTesting and saving colorized images...")
+    
+    # Turn off gradients for inference mode, no backpropagation needed and saves memory
+    num_images = 0 # total number of images
+    with torch.no_grad():
+        # Loops through each batch from test set
+        for i, (L_batch, ab_true) in enumerate(test_loader):
+            L_batch, ab_true = L_batch.to(DEVICE), ab_true.to(DEVICE)
+            ab_pred = model(L_batch) # Predict a* and b* channels
             
-            epoch_loss = running_loss / len(train_loader)
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+            # Calculate MSE for this batch
+            batch_mse = mse(ab_pred, ab_true).item()
+            total_mse += batch_mse * L_batch.size(0) # Multiply by number of images in batch
+            num_images += L_batch.size(0)
             
-            # Evaluate and save intermediate results every 5 epochs.
-            if (epoch + 1) % 5 == 0:
-                model.eval()
-                test_loss = 0.0
-                with torch.no_grad():
-                    for l_imgs, ab_imgs in test_loader:
-                        l_imgs = l_imgs.to(device)
-                        ab_imgs = ab_imgs.to(device)
-                        ab_preds = model(l_imgs)
-                        loss = criterion(ab_preds, ab_imgs)
-                        test_loss += loss.item()
-                test_loss /= len(test_loader)
-                print(f"Test Loss: {test_loss:.4f}")
-                
-                # Save a few colorized samples for visualization.
-                print(f"Saving intermediate results for epoch {epoch+1}...")
-                save_dir = os.path.join(COLORIZED_DIR, f"epoch_{epoch+1}")
-                os.makedirs(save_dir, exist_ok=True)
-                with torch.no_grad():
-                    for i, (l_img, _) in enumerate(test_loader):
-                        if i >= 5:
-                            break
-                        l_img = l_img.to(device)
-                        ab_pred = model(l_img)
-                        l_numpy = l_img[0, 0].cpu().numpy()
-                        a_numpy = ab_pred[0, 0].cpu().numpy() + 128
-                        b_numpy = ab_pred[0, 1].cpu().numpy() + 128
-                        lab_img = np.zeros((l_numpy.shape[0], l_numpy.shape[1], 3), dtype=np.uint8)
-                        lab_img[:, :, 0] = np.clip(l_numpy * (255.0/100.0), 0, 255).astype(np.uint8)
-                        lab_img[:, :, 1] = np.clip(a_numpy, 0, 255).astype(np.uint8)
-                        lab_img[:, :, 2] = np.clip(b_numpy, 0, 255).astype(np.uint8)
-                        rgb_img = cv2.cvtColor(lab_img, cv2.COLOR_Lab2BGR)
-                        cv2.imwrite(os.path.join(save_dir, f"sample_{i}.jpg"), rgb_img)
-        
-        print("Training complete!")
-        torch.save(model.state_dict(), os.path.join(COLORIZED_DIR, "colorization_model.pth"))
-        print("Generating final colorized images...")
-        save_colorized_images(model, test_loader, device)
-        print(f"Colorized images saved in {COLORIZED_DIR}")
-        
-    except Exception as e:
-        print(f"Error during training: {e}")
-        import traceback
-        traceback.print_exc()
+            # Save the images
+            for j in range(L_batch.shape[0]):
+                img_bgr = lab_to_bgr(L_batch[j], ab_pred[j])
+                idx = i * BATCH_SIZE + j
+                cv2.imwrite(f"colorized_outputs/img_{idx}.png", img_bgr)
+    
+    # Report test MSE over all test images
+    avg_mse = total_mse / num_images
+    print(f"\nTest Set Mean Squared Error: {avg_mse:.4f}")
 
 if __name__ == "__main__":
     main()
