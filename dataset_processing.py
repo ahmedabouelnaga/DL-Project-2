@@ -5,12 +5,9 @@ import torch
 import numpy as np
 
 
-# 0) Set default Torch dtype to 32-bit float BEFORE loading data
 torch.set_default_dtype(torch.float32)
-# or: torch.setdefaulttensortype('torch.FloatTensor')
 
-
-# 1) Load and Shuffle the Original Dataset
+# 1. Load and Shuffle the Original Dataset
 img_dir_pattern = "/Users/ahmed/CU(Tech)/Deep Learning/Project 2/face_images/*.jpg"
 files = glob.glob(img_dir_pattern)
 print(f"Found {len(files)} images.")
@@ -39,9 +36,9 @@ data_tensor = data_tensor[perm]
 
 
 # 2) Augment the Dataset
-#    - Horizontal flip (50% chance)
-#    - Random crop -> resize
-#    - Scale RGB by [0.6, 1.0]
+#Horizontal flip (50% chance)
+#Random crop -> resize
+#Scale RGB by [0.6, 1.0]
 
 augmentation_factor = 10
 augmented_images = []  # will hold the augmented images as BGR uint8
@@ -87,16 +84,14 @@ augmented_images = np.array(augmented_images)  # shape: (N*10, 128, 128, 3)
 print("Augmented images shape:", augmented_images.shape)
 
 
-# 3) Save the Augmented Dataset (RGB) BEFORE LAB Conversion
-#    The instructions want them in a folder named "augmented/"
+#3.Save the Augmented Dataset (RGB) BEFORE LAB Conversion
+#The instructions want them in a folder named "augmented/"
 os.makedirs("augmented", exist_ok=True)
 for idx, img_bgr in enumerate(augmented_images):
     cv2.imwrite(f"augmented/aug_{idx:04d}.jpg", img_bgr)
 
-
 # 4) Convert to L*a*b* and Save the Augmented LAB Dataset
-#    We also need to create an intensity image for L*, and
-#    color mappings for a* (green<->magenta) and b* (blue<->yellow).
+#We also need to create an intensity image for L*, and color mappings for a* (green<->magenta) and b* (blue<->yellow).
 
 os.makedirs("augmented_lab", exist_ok=True)  # Full LAB images
 os.makedirs("L", exist_ok=True)
@@ -178,7 +173,7 @@ for idx, img_bgr in enumerate(augmented_images):
     b_vis = map_b_channel_to_blue_yellow(b_channel)
     b_filename = f"b/b_{idx:04d}.png"
     cv2.imwrite(b_filename, b_vis)
-
+#Just for us to make sure that this worked and fully ran
 print("All done!")
 print("1) Augmented (RGB) images in 'augmented/'")
 print("2) LAB images in 'augmented_lab/'")
