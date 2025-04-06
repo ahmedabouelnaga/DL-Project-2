@@ -404,7 +404,6 @@ def main():
                         cv2.imwrite(os.path.join(save_dir, f"sample_{i}.jpg"), rgb_img)
         
         print("Training complete!")
-        torch.save(model.state_dict(), os.path.join(COLORIZED_DIR, "colorization_model.pth"))
         print("Generating final colorized images...")
         save_colorized_images(model, test_loader, device)
         print(f"Colorized images saved in {COLORIZED_DIR}")
