@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
 import numpy as np
 import cv2
 import os
@@ -11,6 +12,8 @@ MAX_ITER = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+# Enable cuDNN benchmarking for faster convolution operations
+torch.backends.cudnn.benchmark = True
 os.makedirs("colorized_outputs", exist_ok=True)
 
 class ColorDataset(Dataset):
@@ -84,12 +87,15 @@ def main():
     train_data = data[shuffle_idx[:train_size]]
     eval_data = data[shuffle_idx[train_size:]]
     
-    train_loader = DataLoader(ColorDataset(train_data), batch_size=BS, shuffle=True, pin_memory=True)
-    eval_loader = DataLoader(ColorDataset(eval_data), batch_size=BS, shuffle=False, pin_memory=True)
+    train_loader = DataLoader(ColorDataset(train_data), batch_size=BS, shuffle=True, pin_memory=True, num_workers=4)
+    eval_loader = DataLoader(ColorDataset(eval_data), batch_size=BS, shuffle=False, pin_memory=True, num_workers=4)
     
     net = ImgColorizer().to(DEVICE)
     loss_fn = nn.MSELoss()
     opt = torch.optim.Adam(net.parameters(), lr=LR)
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler('cuda') if DEVICE.type == 'cuda' else None
     
     print("Beginning training process...\n")
     for epoch in range(MAX_ITER):
@@ -99,10 +105,21 @@ def main():
         for gray_in, color_gt in train_loader:
             gray_in, color_gt = gray_in.to(DEVICE), color_gt.to(DEVICE)
             opt.zero_grad()
-            color_pred = net(gray_in)
-            err = loss_fn(color_pred, color_gt)
-            err.backward()
-            opt.step()
+            
+            # Use mixed precision for forward pass
+            with autocast('cuda', enabled=DEVICE.type == 'cuda'):
+                color_pred = net(gray_in)
+                err = loss_fn(color_pred, color_gt)
+            
+            # Scale gradients and optimize
+            if scaler is not None:
+                scaler.scale(err).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                err.backward()
+                opt.step()
+                
             epoch_loss += err.item()
         
         mean_loss = epoch_loss / len(train_loader)
@@ -121,9 +138,11 @@ def main():
     with torch.no_grad():
         for batch_idx, (grayscale, true_color) in enumerate(eval_loader):
             grayscale, true_color = grayscale.to(DEVICE), true_color.to(DEVICE)
-            pred_color = net(grayscale)
             
-            batch_error = error_calc(pred_color, true_color).item()
+            with autocast('cuda', enabled=DEVICE.type == 'cuda'):
+                pred_color = net(grayscale)
+                batch_error = error_calc(pred_color, true_color).item()
+            
             cumulative_error += batch_error * grayscale.size(0)
             image_count += grayscale.size(0)
             
@@ -138,6 +157,13 @@ def main():
         print(f"\nValidation Set Average Error: {final_error:.4f}")
     else:
         print("\nNo validation images were processed. Check your dataset.")
+    
+    # Add proper CUDA synchronization and memory management
+    if DEVICE.type == 'cuda':
+        torch.cuda.synchronize()
+        print(f"Max GPU memory allocated: {torch.cuda.max_memory_allocated(DEVICE) / 1e9:.2f} GB")
+        print(f"GPU memory currently allocated: {torch.cuda.memory_allocated(DEVICE) / 1e9:.2f} GB")
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()
