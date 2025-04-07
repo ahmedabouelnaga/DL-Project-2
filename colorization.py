@@ -11,7 +11,7 @@ MAX_ITER = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
-os.makedirs("colorization_output", exist_ok=True)
+os.makedirs("colorized_outputs", exist_ok=True)
 
 class ColorDataset(Dataset):
     def __init__(self, data_tensor):
@@ -106,10 +106,10 @@ def main():
             epoch_loss += err.item()
         
         mean_loss = epoch_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{MAX_ITER}], Error: {mean_loss:.4f}\n")
+        print(f"Iteration [{epoch+1}/{MAX_ITER}], Error: {mean_loss:.4f}\n")
     
-    torch.save(net.state_dict(), "colorization.pt")
-    print("Neural network saved as 'colorization.pt'")
+    torch.save(net.state_dict(), "colorization_model.pt")
+    print("Neural network saved as 'colorization_model.pt'")
     
     net.eval()
     error_calc = nn.MSELoss()
@@ -130,7 +130,8 @@ def main():
             for img_idx in range(grayscale.shape[0]):
                 output_img = convert_to_image(grayscale[img_idx], pred_color[img_idx])
                 result_idx = batch_idx * BS + img_idx
-                cv2.imwrite(f"colorized_Output/result_{result_idx}.png", output_img)
+                cv2.imwrite(f"colorized_outputs/result_{result_idx}.png", output_img)
+    
     # Make sure image_count is not zero to avoid division by zero error
     if image_count > 0:
         final_error = cumulative_error / image_count
