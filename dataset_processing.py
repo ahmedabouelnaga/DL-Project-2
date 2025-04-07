@@ -85,6 +85,7 @@ print("Augmented dataset dimensions:", enhanced_images.shape)
 Path("augmented").mkdir(exist_ok=True)
 for i, img_bgr in enumerate(enhanced_images):
     cv2.imwrite(f"augmented/enhanced_{i:04d}.jpg", img_bgr)
+
 # 4) Transform to L*a*b* and Store the Enhanced LAB Dataset
 #    Create separate channels for L* (intensity), 
 #    a* (green-magenta spectrum) and b* (blue-yellow spectrum)
@@ -141,6 +142,9 @@ def visualize_b_channel(b_channel):
     visualization = np.dstack([blue, green, red]).astype(np.uint8)
     return visualization
 
+# Create a list to store LAB tensors
+lab_tensor_list = []
+
 for i, img_bgr in enumerate(enhanced_images):
     # Transform BGR -> LAB
     img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
@@ -166,8 +170,19 @@ for i, img_bgr in enumerate(enhanced_images):
     b_visual = visualize_b_channel(b_channel)
     b_filename = f"b/b_{i:04d}.png"
     cv2.imwrite(b_filename, b_visual)
+    
+    # Convert LAB to tensor and add to list
+    lab_float = img_lab.astype(np.float32)
+    lab_tensor = torch.from_numpy(lab_float).permute(2, 0, 1)
+    lab_tensor_list.append(lab_tensor)
+
+# Stack all LAB tensors into a single tensor and save to file
+lab_tensor_stacked = torch.stack(lab_tensor_list)
+torch.save(lab_tensor_stacked, "lab_tensor.pt")
+print(f"Created lab_tensor.pt with shape: {lab_tensor_stacked.shape}")
 
 print("Processing complete!")
 print("1) Enhanced RGB images saved to 'augmented/'")
 print("2) LAB converted images saved to 'augmented_lab/'") 
 print("3) Channel visualizations saved to 'L/', 'a/', and 'b/' folders.")
+print("4) LAB tensor saved as 'lab_tensor.pt'")
