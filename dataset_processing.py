@@ -5,12 +5,8 @@ import torch
 import numpy as np
 from pathlib import Path
 
-# ---------------------------------------------------------------
-# 0) Configure torch to use 32-bit floating point precision initially
 torch.set_default_dtype(torch.float32)
-# Alternative approach: torch.setdefaulttensortype('torch.FloatTensor')
 
-# ---------------------------------------------------------------
 # 1) Import and Randomize the Source Dataset
 image_pattern = "/DATA/ahmedabouelnaga/DL-Project-2/face_images/*.jpg"
 image_files = glob.glob(image_pattern)
@@ -39,11 +35,7 @@ sample_count = image_tensor.size(0)
 random_indices = torch.randperm(sample_count)
 image_tensor = image_tensor[random_indices]
 
-# ---------------------------------------------------------------
 # 2) Expand the Dataset with Augmentation
-#    - Mirror flip (50% probability)
-#    - Dynamic cropping and resize
-#    - RGB intensity adjustment [0.6, 1.0]
 
 expansion_multiplier = 10
 enhanced_images = []  # will store the augmented images as BGR uint8
@@ -88,18 +80,14 @@ for idx in range(image_tensor.size(0)):
 enhanced_images = np.array(enhanced_images)  # dimensions: (N*10, 128, 128, 3)
 print("Augmented dataset dimensions:", enhanced_images.shape)
 
-# ---------------------------------------------------------------
 # 3) Store the Enhanced Dataset (RGB) BEFORE LAB Transformation
 #    Save to directory named "augmented/"
 Path("augmented").mkdir(exist_ok=True)
 for i, img_bgr in enumerate(enhanced_images):
     cv2.imwrite(f"augmented/enhanced_{i:04d}.jpg", img_bgr)
-
-# ---------------------------------------------------------------
 # 4) Transform to L*a*b* and Store the Enhanced LAB Dataset
 #    Create separate channels for L* (intensity), 
 #    a* (green-magenta spectrum) and b* (blue-yellow spectrum)
-
 Path("augmented_lab").mkdir(exist_ok=True)  # Complete LAB images
 Path("L").mkdir(exist_ok=True)
 Path("a").mkdir(exist_ok=True)
