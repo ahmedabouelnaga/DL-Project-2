@@ -1,197 +1,135 @@
-#!/usr/bin/env python
-import os
-import cv2
-import glob
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import TensorDataset, DataLoader
+import numpy as np
+import random
 
+def fix_randomness(seed_val=42):
+    """Set random seeds for reproducibility"""
+    random.seed(seed_val)
+    np.random.seed(seed_val)
+    torch.manual_seed(seed_val)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_val)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-# 1. Dataset Definition
-class RegressorDataset(Dataset):
-    """
-    Dataset that loads corresponding L, a, and b channel images.
-    - L_dir: Directory containing L channel images (grayscale). These images are assumed to have values in [0, 100].
-    - a_dir and b_dir: Directories containing the a and b channel images.
-      For a and b, we convert the 8-bit images to float32 and subtract 128, then compute the mean value.
-    The input is the scaled L channel (divided by 100 to map to [0,1]).
-    The target is a vector [mean_a, mean_b] computed across the entire image.
-    """
-    def __init__(self, L_dir, a_dir, b_dir, transform=None):
-        self.L_files = sorted(glob.glob(os.path.join(L_dir, "*.*")))
-        self.a_files = sorted(glob.glob(os.path.join(a_dir, "*.*")))
-        self.b_files = sorted(glob.glob(os.path.join(b_dir, "*.*")))
-        
-        if not self.L_files or not self.a_files or not self.b_files:
-            raise ValueError("One or more directories do not contain image files.")
-        
-        # Use the smallest count to ensure matching samples
-        self.dataset_size = min(len(self.L_files), len(self.a_files), len(self.b_files))
-        self.L_files = self.L_files[:self.dataset_size]
-        self.a_files = self.a_files[:self.dataset_size]
-        self.b_files = self.b_files[:self.dataset_size]
-        self.transform = transform
+class ColorPredictor(nn.Module):
+    """Neural network to predict color values from grayscale input"""
     
-    def __len__(self):
-        return self.dataset_size
-    
-    def __getitem__(self, idx):
-        # Load the L channel image in grayscale
-        L_img = cv2.imread(self.L_files[idx], cv2.IMREAD_GRAYSCALE)
-        a_img = cv2.imread(self.a_files[idx], cv2.IMREAD_GRAYSCALE)
-        b_img = cv2.imread(self.b_files[idx], cv2.IMREAD_GRAYSCALE)
-        
-        if L_img is None or a_img is None or b_img is None:
-            raise ValueError(f"Failed to load images at index {idx}.")
-        
-        # The L channel originally ranges from 0 to 100.
-        # Scale it to [0,1] by dividing by 100.
-        L_img = L_img.astype(np.float32) / 100.0
-        
-        # For a and b channels, convert to float and subtract 128 to center the values.
-        a_img = a_img.astype(np.float32) - 128.0
-        b_img = b_img.astype(np.float32) - 128.0
-        
-        # Compute mean chrominance values over all pixels.
-        mean_a = np.mean(a_img)
-        mean_b = np.mean(b_img)
-        target = np.array([mean_a, mean_b], dtype=np.float32)
-        
-        # Optionally apply a transformation to L_img.
-        if self.transform:
-            L_img = self.transform(L_img)
-        else:
-            # Ensure the image has a channel dimension: (1, H, W)
-            L_img = np.expand_dims(L_img, axis=0)
-        
-        # Convert to PyTorch tensors.
-        input_tensor = torch.from_numpy(L_img)
-        target_tensor = torch.from_numpy(target)
-        return input_tensor, target_tensor
-
-
-# 2. Regressor Model Definition
-
-class RegressorCNN(nn.Module):
     def __init__(self):
-        super(RegressorCNN, self).__init__()
-        self.module1 = nn.Sequential(
-            nn.Conv2d(1, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
+        super(ColorPredictor, self).__init__()
+        
+        # Encoder network that progressively reduces spatial dimensions
+        self.encoder = nn.Sequential(
+            # Layer 1: 128x128 -> 64x64
+            nn.Conv2d(1, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 2: 64x64 -> 32x32
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 3: 32x32 -> 16x16
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 4: 16x16 -> 8x8
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 5: 8x8 -> 4x4
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 6: 4x4 -> 2x2
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU(),
+            
+            # Layer 7: 2x2 -> 1x1
+            nn.Conv2d(3, 3, 3, stride=2, padding=1),
+            nn.ReLU()
         )
-        self.module2 = nn.Sequential(
-            nn.Conv2d(3, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.module3 = nn.Sequential(
-            nn.Conv2d(3, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.module4 = nn.Sequential(
-            nn.Conv2d(3, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.module5 = nn.Sequential(
-            nn.Conv2d(3, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.module6 = nn.Sequential(
-            nn.Conv2d(3, 3, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        # Module 7: final convolution to output 2 channels. The spatial size becomes 1x1.
-        self.module7 = nn.Conv2d(3, 2, kernel_size=3, stride=2, padding=1)
+        
+        # Final prediction layer
+        self.predictor = nn.Linear(3, 2)
     
     def forward(self, x):
-        # Pass through the 7 modules sequentially.
-        x = self.module1(x)  # (batch, 3, 64, 64)
-        x = self.module2(x)  # (batch, 3, 32, 32)
-        x = self.module3(x)  # (batch, 3, 16, 16)
-        x = self.module4(x)  # (batch, 3, 8, 8)
-        x = self.module5(x)  # (batch, 3, 4, 4)
-        x = self.module6(x)  # (batch, 3, 2, 2)
-        x = self.module7(x)  # (batch, 2, 1, 1)
-        x = x.view(x.size(0), -1)  # Flatten to (batch, 2)
-        return x
+        features = self.encoder(x)
+        flattened = features.view(features.size(0), -1)
+        predictions = self.predictor(flattened)
+        return predictions
 
-
-# 3. Training and Evaluation Functions
-
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0.0
-    for inputs, targets in dataloader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * inputs.size(0)
-    return total_loss / len(dataloader.dataset)
-
-def evaluate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            total_loss += loss.item() * inputs.size(0)
-    return total_loss / len(dataloader.dataset)
-
-
-# 4. Main Routine
-
-def main():
-    # Directories for the L, a, and b images.
-    # Update these paths as needed.
-    L_dir = "./L"
-    a_dir = "./a"
-    b_dir = "./b"
+def run_training():
+    # Load the previously prepared LAB tensor data
+    color_data = torch.load("lab_tensor.pt")
     
-    # Hyperparameters.
+    # Fix random seed for reproducibility
+    fix_randomness()
+    
+    # Extract and normalize luminance channel (L*)
+    luminance = color_data[:, 0:1, :, :] / 100.0
+    
+    # Calculate average a* and b* values for each image
+    color_targets = color_data[:, 1:, :, :].mean(dim=[2, 3])
+    
+    # Create dataset
+    training_set = TensorDataset(luminance, color_targets)
+    
+    # Configure mini-batch processing
     batch_size = 16
-    num_epochs = 20
-    learning_rate = 0.001
+    data_loader = DataLoader(
+        training_set, 
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True
+    )
     
-    # Set the default Torch data type to 32-bit float.
-    torch.set_default_dtype(torch.float32)
+    # Determine hardware device
+    hw_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on: {hw_device}")
     
-    # Device configuration.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Create model instance
+    net = ColorPredictor().to(hw_device)
     
-    # Create the dataset and split into training (90%) and testing (10%).
-    full_dataset = RegressorDataset(L_dir, a_dir, b_dir)
-    dataset_size = len(full_dataset)
-    train_size = int(0.9 * dataset_size)
-    test_size = dataset_size - train_size
-    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
+    # Setup optimizer and loss function
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    # Training loop
+    epochs = 10
+    for epoch in range(epochs):
+        net.train()
+        running_loss = 0.0
+        
+        for inputs, targets in data_loader:
+            # Move data to appropriate device
+            inputs = inputs.to(hw_device)
+            targets = targets.to(hw_device)
+            
+            # Zero gradients
+            opt.zero_grad()
+            
+            # Forward pass
+            outputs = net(inputs)
+            
+            # Calculate loss
+            loss = loss_fn(outputs, targets)
+            
+            # Backward pass and optimize
+            loss.backward()
+            opt.step()
+            
+            # Accumulate loss
+            running_loss += loss.item() * inputs.shape[0]
+        
+        # Calculate epoch loss
+        epoch_loss = running_loss / len(training_set)
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.4f}")
     
-    # Initialize the model, criterion, and optimizer.
-    model = RegressorCNN().to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Training loop.
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        test_loss = evaluate(model, test_loader, criterion, device)
-        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss = {train_loss:.4f}, Test Loss = {test_loss:.4f}")
-    
-    # Save the trained model.
-    model_path = "regressor_model.pth"
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+    # Save trained model
+    torch.save(net.state_dict(), "regressor_model.pt")
+    print("Model saved successfully!")
 
 if __name__ == "__main__":
-    main()
+    run_training()
